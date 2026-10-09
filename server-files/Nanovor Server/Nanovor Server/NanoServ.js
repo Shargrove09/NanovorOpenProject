@@ -31,8 +31,13 @@ const {
     GIFT_BY_VALUE,
     rollPack,
     grantToUser,
+    newNanovorAssetId,
     buildSkuListXml,
 } = require('./economy');
+// Nanoscope handheld: on-device file formats and the vault of captured signed files
+const nanoscope = require('./nanoscope');
+const deviceVault = new nanoscope.DeviceVault(path.join(__dirname, 'DeviceVault'));
+const DEVICE_CHARACTERS_DIR = path.join(__dirname, 'Manifests', 'device', 'Characters');
 
 // Initialize Express app
 const app = express();
@@ -52,6 +57,9 @@ app.use(express.text({ type: 'text/plain', limit: '10mb' }));
 // type req.body stays undefined and every such handler sees an empty body.
 // The /xmlrpc mounts above are registered first, so SRB is unaffected.
 app.use(express.text({ type: ['application/xml', 'text/xml'], limit: '10mb' }));
+// Nanoscope uploads (deviceid.bbb, jolts-N.bbb, clog.bbb) arrive as raw
+// application/octet-stream; without this req.body is {} and the bytes are lost.
+app.use('/device', express.raw({ type: 'application/octet-stream', limit: '10mb' }));
 
 // ---------------------------------------------------------------------------
 // Web-hook path aliases.
@@ -1500,36 +1508,27 @@ app.post('/bankfe/resources/evolution/:evolutionId', (req, res) => {
     res.send('success');
 });
 
-// Device management endpoint
+// Nanoscopes associated with the account.
+//
+// AssociatedDevices.as reads <device id="..."/> as DIRECT children of the root and
+// compares Number(id) with the id in the device's deviceid.bbb. A device missing
+// from this list gets the Associate panel, whose "+" button deletes v1..v10 on
+// the device immediately (DeviceManager.associateDevice) - so a device must be
+// registered here (nanoscope-cli import) before anyone opens the Nanoscope screen.
 app.get('/bankfe/resources/account/:accountId/device', (req, res) => {
     const accountId = req.params.accountId;
-    const auth = req.query.auth;
-
-    console.log(`[${new Date().toISOString()}] Device management request for account ${accountId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers);
-
-    // Verify token
-    const session = findSessionByToken(auth);
+    const session = findSessionByToken(req.query.auth);
     if (!session || session.accountId !== accountId) {
-        console.log(`[${new Date().toISOString()}] Invalid token for device management request - session: ${session ? session.accountId : 'none'}, accountId: ${accountId}`);
+        console.log(`[nanoscope] device list: invalid token for account ${accountId}`);
         return res.status(401).send('<error>Invalid token</error>');
     }
-
-    // Return device management info
     const user = users[accountId];
-    if (!user) {
-        console.log(`[${new Date().toISOString()}] User not found for device management request - accountId: ${accountId}`);
-        return res.status(404).send('<error>User not found</error>');
-    }
+    if (!user) return res.status(404).send('<error>User not found</error>');
 
-    // Return device information (placeholder)
-    const deviceInfo = `
-<device-management xmlns="http://127.0.0.1:8443/xsd/device/device-management.xsd">
-</device-management>`;
-
-    console.log(`[${new Date().toISOString()}] Sending device management response for account ${accountId}`);
+    const ids = (user.devices || []).map(d => nanoscope.normalizeDeviceId(d.deviceId));
+    console.log(`[nanoscope] device list for ${accountId}: [${ids.join(', ')}]`);
     res.set('Content-Type', 'application/xml');
-    res.send(deviceInfo);
+    res.send(`<devices>${ids.map(id => `<device id="${id}"/>`).join('')}</devices>`);
 });
 
 // Account asset endpoint - returns user's assets/collections
@@ -1585,10 +1584,10 @@ app.get('/bankfe/resources/account/:accountId/asset', (req, res) => {
       </ns2:asset-miscellany>
       <ns3:asset-stat>
         <ns3:asset-type-id>${nanovor.assetTypeId || nanovor.id}</ns3:asset-type-id>
-        <ns3:speed>${nanovor.speed || 10}</ns3:speed>
-        <ns3:strength>${nanovor.strength || 100}</ns3:strength>
-        <ns3:armor>${nanovor.armor || 5}</ns3:armor>
-        <ns3:health>${nanovor.health || 100}</ns3:health>
+        <ns3:speed>${nanovor.speed ?? 10}</ns3:speed>
+        <ns3:strength>${nanovor.strength ?? 100}</ns3:strength>
+        <ns3:armor>${nanovor.armor ?? 5}</ns3:armor>
+        <ns3:health>${nanovor.health ?? 100}</ns3:health>
         <ns3:kill-count>${nanovor.killCount || 0}</ns3:kill-count>
         <ns3:kill-count-lifetime>${nanovor.lifetimeKillCount || 0}</ns3:kill-count-lifetime>
         <ns3:battle-count>${nanovor.battleCount || 0}</ns3:battle-count>
@@ -1935,93 +1934,276 @@ app.post('/bankfe/resources/retail/:skuId', (req, res) => {
 });
 
 
-// Device jolt endpoint
-app.post('/device/:deviceId/jolt', (req, res) => {
-    const deviceId = req.params.deviceId;
-    const auth = req.query.auth;
+/// ---------------------------------------------------------------------------
+// Nanoscope sync (the client's DeviceState screen).
+//
+// The handheld is a USB drive; the client copies files on and off it and calls
+// these routes to move them to and from the server. Formats: nanoscope.js.
+//
+// What works and what can't yet:
+//   - device list, association, jolt uploads: fully handled.
+//   - sign/vinfo and sign/plyinfo must return bytes SIGNED for the device, and we
+//     can't sign. They replay files captured from the device by
+//     `node tools/nanoscope-cli.js import` (DeviceVault/). Anything else is refused,
+//     so only nanovor imported from a device can go back onto that device.
+//   - firmware, required files, minigames: device-manifest.xml lists none and a
+//     firmware version of -1, so the client never pushes any of them.
+//   - /device/:id/manifest, /device/:id/firmware/signature, /device/reset/*: 404 on
+//     purpose. Those flows rewrite the device's firmware and keys.
+//
+// HAZARD: a transfer starts by deleting v1..v10 on the device and only then asks
+// for each vinfo. A refused vinfo leaves the device short of nanovor; restore
+// from a backup with nanoscope-cli.
+// ---------------------------------------------------------------------------
 
-    console.log(`[${new Date().toISOString()}] Device jolt request for device ${deviceId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers, 'Body:', req.body.toString());
-
-    // Verify token
-    const session = findSessionByToken(auth);
-    if (!session) {
-        console.log(`[${new Date().toISOString()}] Invalid token for device jolt request - auth: ${auth}`);
-        return res.status(401).send('<error>Invalid token</error>');
-    }
-
-    // Parse the jolt data from the request
-    const joltData = req.body.toString();
-    console.log(`[${new Date().toISOString()}] Device jolt data: ${joltData}`);
-
-    // For now, just acknowledge the request
-    console.log(`[${new Date().toISOString()}] Processed jolt request for device ${deviceId}`);
-
-    // Return success response
-    const response = `<device-jolt-success xmlns="http://127.0.0.1:8443/xsd/device-jolt/device-jolt-success.xsd"/>`;
-
-    console.log(`[${new Date().toISOString()}] Sending device jolt success response for device ${deviceId}`);
-    res.set('Content-Type', 'application/xml');
-    res.send(response);
-});
-
-// Device asset verification endpoint
-app.get('/device/:deviceId/asset/:assetId/sign/vinfo', (req, res) => {
-    const deviceId = req.params.deviceId;
-    const assetId = req.params.assetId;
-    const auth = req.query.auth;
-
-    console.log(`[${new Date().toISOString()}] Device asset verification request for device ${deviceId}, asset ${assetId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers);
-
-    // Verify token
-    const session = findSessionByToken(auth);
-    if (!session) {
-        console.log(`[${new Date().toISOString()}] Invalid token for device asset verification request - auth: ${auth}`);
-        return res.status(401).send('<error>Invalid token</error>');
-    }
-
-    // Return asset verification info (placeholder)
-    const assetVerification = `
-<asset-verification xmlns="http://127.0.0.1:8443/xsd/asset-verification/asset-verification.xsd">
-</asset-verification>`;
-
-    console.log(`[${new Date().toISOString()}] Sending asset verification response for device ${deviceId}, asset ${assetId}`);
-    res.set('Content-Type', 'application/xml');
-    res.send(assetVerification);
-});
-
-// Device player info endpoint
-app.get('/device/:deviceId/account/:accountId/sign/plyinfo', (req, res) => {
-    const deviceId = req.params.deviceId;
-    const accountId = req.params.accountId;
-    const auth = req.query.auth;
-
-    console.log(`[${new Date().toISOString()}] Device player info request for device ${deviceId}, account ${accountId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers);
-
-    // Verify token
-    const session = findSessionByToken(auth);
-    if (!session || session.accountId !== accountId) {
-        console.log(`[${new Date().toISOString()}] Invalid token for device player info request - session: ${session ? session.accountId : 'none'}, accountId: ${accountId}`);
-        return res.status(401).send('<error>Invalid token</error>');
-    }
-
-    // Return player info
-    const user = users[accountId];
+// /device/* URLs carry ?auth= but mostly no account id; the token identifies it.
+function deviceRequestUser(req, res, what) {
+    const session = findSessionByToken(req.query.auth);
+    const user = session && users[session.accountId];
     if (!user) {
-        console.log(`[${new Date().toISOString()}] User not found for device player info request - accountId: ${accountId}`);
-        return res.status(404).send('<error>User not found</error>');
+        console.log(`[nanoscope] ${what}: invalid token`);
+        res.status(401).send('<error>Invalid token</error>');
+        return null;
     }
+    return { accountId: session.accountId, user };
+}
 
-    // Return player information (placeholder)
-    const playerInfo = `
-<player-info xmlns="http://127.0.0.1:8443/xsd/player-info/player-info.xsd">
-</player-info>`;
+function findUserDevice(user, deviceId) {
+    const want = nanoscope.normalizeDeviceId(deviceId);
+    return (user.devices || []).find(d => nanoscope.normalizeDeviceId(d.deviceId) === want) || null;
+}
 
-    console.log(`[${new Date().toISOString()}] Sending player info response for device ${deviceId}, account ${accountId}`);
+function associateDeviceWithUser(user, parsedDeviceId, source) {
+    if (!user.devices) user.devices = [];
+    let entry = findUserDevice(user, parsedDeviceId.deviceId);
+    if (!entry) {
+        entry = { deviceId: parsedDeviceId.deviceId, associatedAt: new Date().toISOString(), source };
+        user.devices.push(entry);
+    }
+    entry.firmware = parsedDeviceId.firmware;
+    entry.lastSeenAt = new Date().toISOString();
+    return entry;
+}
+
+// Body: the device's raw deviceid.bbb. Any 2xx counts as success. By the time
+// this arrives the client has already deleted v1..v10 on the device.
+app.post('/device/associate', (req, res) => {
+    const ctx = deviceRequestUser(req, res, 'associate');
+    if (!ctx) return;
+    let parsed;
+    try {
+        parsed = nanoscope.parseDeviceId(Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
+    } catch (err) {
+        console.log(`[nanoscope] associate: unreadable deviceid.bbb (${err.message})`);
+        return res.status(400).send('<error>Bad device id file</error>');
+    }
+    associateDeviceWithUser(ctx.user, parsed, 'client');
+    saveUserData(ctx.accountId);
+    console.log(`[nanoscope] associated device ${parsed.deviceId} (firmware field ${parsed.firmware}) with ${ctx.accountId}`);
     res.set('Content-Type', 'application/xml');
-    res.send(playerInfo);
+    res.send('<device-associate-success/>');
+});
+
+// Body: one raw jolts-N.bbb (jolt points earned in the device's minigames since
+// the last successful upload). The client deletes the file only after a 2xx.
+app.post('/device/:deviceId/jolt', (req, res) => {
+    const ctx = deviceRequestUser(req, res, 'jolt upload');
+    if (!ctx) return;
+    const { accountId, user } = ctx;
+    const deviceId = req.params.deviceId;
+    if (!findUserDevice(user, deviceId)) {
+        console.log(`[nanoscope] jolt upload: device ${deviceId} is not associated with ${accountId}`);
+        return res.status(403).send('<error>Device not associated</error>');
+    }
+    const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    let jolts;
+    try {
+        jolts = nanoscope.parseJolts(body);
+    } catch (err) {
+        console.log(`[nanoscope] jolt upload: unreadable file (${err.message})`);
+        return res.status(400).send('<error>Bad jolts file</error>');
+    }
+    deviceVault.archiveUpload(deviceId, 'jolts', body);
+
+    // A failed upload is retried on the next sync, so the same file can arrive
+    // twice. The device rewrites the tag with the content, so (device, session,
+    // tag) identifies one upload.
+    const key = `${nanoscope.normalizeDeviceId(deviceId)}:${jolts.session}:${jolts.tag}`;
+    if (!user.deviceJoltUploads) user.deviceJoltUploads = [];
+    if (user.deviceJoltUploads.includes(key)) {
+        console.log(`[nanoscope] jolt upload ${key} was already credited - ignoring`);
+    } else {
+        // Credited as-is. The tag can't be verified yet, and the original server's
+        // earn-rate cap (~1 jolt/sec, per DeviceJoltsUploadChainLoadee) isn't known
+        // precisely enough to reproduce.
+        user.speedJolts = (user.speedJolts || 0) + Math.max(0, jolts.speed);
+        user.strengthJolts = (user.strengthJolts || 0) + Math.max(0, jolts.strength);
+        user.armorJolts = (user.armorJolts || 0) + Math.max(0, jolts.armor);
+        user.healthJolts = (user.healthJolts || 0) + Math.max(0, jolts.health);
+        user.deviceJoltUploads.push(key);
+        saveUserData(accountId);
+        console.log(`[nanoscope] credited jolts from ${deviceId} to ${accountId}: speed +${jolts.speed}, strength +${jolts.strength}, ` +
+            `armor +${jolts.armor}, health +${jolts.health}`);
+    }
+    res.set('Content-Type', 'application/xml');
+    res.send('<device-jolt-success/>');
+});
+
+// Dead with the shipped client - DeviceBattleLogUploadChainLoadee deletes clog.bbb
+// before reading it - but answered properly in case anything sends one.
+// DeviceLogChainLoadee reads <total-updates> and <successful-updates>.
+app.post('/device/:deviceId/battle-log', (req, res) => {
+    const ctx = deviceRequestUser(req, res, 'battle-log upload');
+    if (!ctx) return;
+    const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (body.length) deviceVault.archiveUpload(req.params.deviceId, 'clog', body);
+    console.log(`[nanoscope] battle log from ${req.params.deviceId}: ${body.length} bytes archived, not processed`);
+    res.set('Content-Type', 'application/xml');
+    res.send('<battle-log-result><total-updates>0</total-updates><successful-updates>0</successful-updates></battle-log-result>');
+});
+
+// Raw bytes, written unchanged to v<N>\vinfo.bbb on the device.
+app.get('/device/:deviceId/asset/:assetId/sign/vinfo', (req, res) => {
+    const ctx = deviceRequestUser(req, res, 'sign/vinfo');
+    if (!ctx) return;
+    const { deviceId, assetId } = req.params;
+    if (!findUserDevice(ctx.user, deviceId)) {
+        console.log(`[nanoscope] sign/vinfo: device ${deviceId} is not associated with ${ctx.accountId}`);
+        return res.status(403).send('<error>Device not associated</error>');
+    }
+    if (!(ctx.user.nanovorInventory || []).some(n => String(n.assetId) === assetId)) {
+        console.log(`[nanoscope] sign/vinfo: asset ${assetId} is not in ${ctx.accountId}'s collection`);
+        return res.status(404).send('<error>No such asset</error>');
+    }
+    const blob = deviceVault.getVinfo(deviceId, assetId);
+    if (!blob) {
+        console.log(`[nanoscope] sign/vinfo: NO SIGNED COPY of asset ${assetId} for device ${deviceId}. ` +
+            'Only nanovor imported from this device can go back onto it. The client has already ' +
+            'cleared v1..v10 - restore them with nanoscope-cli.');
+        return res.status(409).send('<error>No signed copy for this device</error>');
+    }
+    console.log(`[nanoscope] sign/vinfo: replaying captured vinfo for asset ${assetId} to device ${deviceId}`);
+    res.set('Content-Type', 'application/octet-stream');
+    res.send(blob);
+});
+
+// Raw bytes, written unchanged to plyinfo.bbb. On failure the client shows
+// "Transfer Error" and goes Home before touching the device's copy.
+app.get('/device/:deviceId/account/:accountId/sign/plyinfo', (req, res) => {
+    const ctx = deviceRequestUser(req, res, 'sign/plyinfo');
+    if (!ctx) return;
+    const { deviceId, accountId } = req.params;
+    if (ctx.accountId !== accountId || !findUserDevice(ctx.user, deviceId)) {
+        console.log(`[nanoscope] sign/plyinfo: device ${deviceId} is not associated with ${accountId}`);
+        return res.status(403).send('<error>Device not associated</error>');
+    }
+    const blob = deviceVault.getPlyinfo(deviceId);
+    if (!blob) {
+        console.log(`[nanoscope] sign/plyinfo: no captured plyinfo for device ${deviceId} - the server cannot sign one`);
+        return res.status(404).send('<error>No signed player info for this device</error>');
+    }
+    console.log(`[nanoscope] sign/plyinfo: replaying captured plyinfo to device ${deviceId}`);
+    res.set('Content-Type', 'application/octet-stream');
+    res.send(blob);
+});
+
+// Never served: these rewrite the device's system manifest, firmware and keys.
+// device-manifest.xml keeps the client from asking for the first two; the
+// recovery flow (reset/*) is reachable from the write-error dialog.
+app.get(['/device/:deviceId/manifest', '/device/:deviceId/firmware/signature', '/device/reset/*'], (req, res) => {
+    console.log(`[nanoscope] refused ${req.path} - firmware/manifest/recovery are deliberately not served`);
+    res.status(404).send('<error>Not available</error>');
+});
+
+// ---------------------------------------------------------------------------
+// Dev / admin: import a Nanoscope into an account.
+//
+// Takes a live drive ("E:\\") or the files/ folder of a nanoscope-cli backup.
+// Registers the device (so the client never shows the destructive Associate
+// panel), adds its nanovor with their on-device asset ids and jolted stats,
+// vaults the signed vinfo/plyinfo for replay, and copies sprites/sounds for
+// types the served /device/characters tree lacks. Re-running is safe.
+//
+// Loopback-only and unauthenticated, like grant-ems.
+//   POST /dev/nanoscope/import   {"account":"2072745562","root":"E:\\"}
+// ---------------------------------------------------------------------------
+app.post('/dev/nanoscope/import', (req, res) => {
+    const remote = req.socket.remoteAddress || '';
+    if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(remote)) {
+        console.warn(`[dev] rejected nanoscope import from non-loopback address ${remote}`);
+        return res.status(403).json({ error: 'dev endpoints are loopback-only' });
+    }
+    const { account, root } = req.body || {};
+    const user = users[account];
+    if (!user) return res.status(404).json({ error: `no such account: ${account}`, known: Object.keys(users) });
+
+    let snap;
+    try {
+        snap = nanoscope.readDeviceRoot(String(root || ''));
+    } catch (err) {
+        return res.status(400).json({ error: err.message });
+    }
+    const deviceId = snap.device.deviceId;
+    associateDeviceWithUser(user, snap.device, 'import');
+    if (snap.plyinfo) deviceVault.putPlyinfo(deviceId, snap.plyinfo);
+    if (!user.nanovorInventory) user.nanovorInventory = [];
+
+    const now = formatDateForNanovor(new Date());
+    const report = [];
+    for (const n of snap.nanovor) {
+        const p = n.parsed;
+        const master = getVirmonMaster(__dirname, p.assetTypeId);
+        if (!master) {
+            report.push({ slot: `v${n.slot}`, assetId: p.assetId, error: `unknown asset-type-id ${p.assetTypeId}` });
+            continue;
+        }
+        deviceVault.putVinfo(deviceId, n.vinfo);
+        const characterAssets = nanoscope.harvestCharacterAssets(n.dir, p.assetTypeId, DEVICE_CHARACTERS_DIR);
+
+        let inst = user.nanovorInventory.find(x => String(x.assetId) === p.assetId);
+        const imported = !inst;
+        if (!inst) {
+            inst = {
+                id: p.assetTypeId,
+                name: master.name,
+                type: 'virmon',
+                assetTypeId: p.assetTypeId,
+                assetId: p.assetId, // must equal the vinfo's u64 as decimal - see DeviceNanovorRetriever
+                faction: master.faction,
+                rarity: master.rarity,
+                wave: master.wave,
+                productionNumber: 1,
+                birthDate: now,
+                lastEvolutionDate: now,
+                nickname: '',
+                source: 'nanoscope',
+            };
+            user.nanovorInventory.push(inst);
+        }
+        // The device copy carries the stats as jolted on the handheld.
+        Object.assign(inst, { speed: p.speed, strength: p.strength, armor: p.armor, health: p.health });
+
+        report.push({
+            slot: `v${n.slot}`,
+            name: master.name,
+            assetTypeId: p.assetTypeId,
+            assetId: p.assetId,
+            imported,
+            characterAssets,
+            // Can a transfer put it back? Needs the vaulted vinfo (just stored) and
+            // the type's sprite/sound on the server.
+            deviceReady: fs.existsSync(path.join(DEVICE_CHARACTERS_DIR, String(p.assetTypeId), 'manifest.xml')),
+        });
+    }
+    saveUserData(account);
+
+    console.log(`[dev] imported Nanoscope ${deviceId} into ${account}: ${report.filter(r => r.imported).length} new nanovor, ` +
+        `${report.filter(r => r.deviceReady).length}/${report.length} device-ready`);
+    res.json({
+        device: { deviceId, firmware: snap.device.firmware },
+        plyinfoVaulted: Boolean(snap.plyinfo),
+        nanovor: report,
+    });
 });
 
 // Manifest endpoints for version checking and updates
@@ -2273,32 +2455,36 @@ app.get('/Assets/Client/Characters/virmon-master-value.xml', (req, res) => {
     }
 });
 
-// Device manifest endpoint
+// Nanoscope system manifest, fetched three times per sync (no auth). The client reads
+// three things, all as direct children of the root:
+//   <firmware-version>  pushed when greater than the device's (DeviceFirmwareChainLoadee).
+//                       -1 never triggers; an absent element reads as 0, which DOES
+//                       trigger on a freshly associated device (version -1).
+//   <file><name>        root files the device must have, else downloaded from
+//                       /device/<name> and followed by a signed manifest.bbb.
+//   <minigame-file><name> games copied from Assets\Device\minigames into g1..gN.
+// Listing nothing makes all three steps no-ops, so a sync never overwrites the
+// device's system files, games or firmware.
 app.get('/device/device-manifest.xml', (req, res) => {
-    console.log(`[${new Date().toISOString()}] Device manifest requested - Query:`, req.query, 'Headers:', req.headers);
-
-    // For now, return a simple device manifest
-    const deviceManifest = `<?xml version="1.0" encoding="UTF-8"?>
-<device-manifest xmlns="http://127.0.0.1:8443/xsd/device-manifest/device-manifest.xsd">
-  <version>
-    <major>1</major>
-    <minor>0</minor>
-    <build>0</build>
-  </version>
-  <devices>
-    <!-- Placeholder for device definitions -->
-  </devices>
-</device-manifest>`;
-
-    console.log(`[${new Date().toISOString()}] Sending device manifest`);
+    console.log('[nanoscope] device-manifest.xml (firmware -1, no files, no minigames)');
     res.set('Content-Type', 'application/xml; charset=utf-8');
-    res.send(deviceManifest);
+    res.send('<device-manifest><firmware-version>-1</firmware-version></device-manifest>');
 });
 
 // Serve the real asset tree. This used to be a blanket 404 that blackholed every
 // /Assets/... request (~21,000 files) and silently shadowed the more specific
 // handlers registered further down this file.
 app.use('/Assets', express.static(path.join(__dirname, 'Manifests', 'Assets')));
+
+// Per-type Nanoscope sprites and sounds: /device/characters/<typeId>/{manifest.xml,
+// spr.v2z,nano.snd}. The client compares manifest.xml as text with its local copy
+// and downloads all three when they differ. (Folder is "Characters" on disk - mind
+// the case on a case-sensitive host.)
+app.use('/device/characters', express.static(DEVICE_CHARACTERS_DIR), (req, res) => {
+    // A miss here aborts a transfer AFTER the client has already cleared v1..v10.
+    console.log(`[nanoscope] no device sprite/sound for ${req.path} - that nanovor type can't go onto a Nanoscope yet`);
+    res.status(404).send('Not found');
+});
 
 // Download manager endpoints
 app.get('/bankfe/manifests/*', (req, res) => {
@@ -2480,26 +2666,6 @@ app.get('/manifests/manifest.xml', (req, res) => {
 
     res.set('Content-Type', 'application/xml; charset=utf-8');
     res.send(manifest);
-});
-
-// Add endpoint for device manifest that might be needed
-app.get('/device/device-manifest.xml', (req, res) => {
-    console.log(`[${new Date().toISOString()}] Device manifest requested, Query:`, req.query, 'Headers:', req.headers);
-
-    const deviceManifest = `<?xml version="1.0" encoding="UTF-8"?>
-<device-manifest xmlns="http://127.0.0.1:8443/xsd/device-manifest/device-manifest.xsd">
-    <version>
-        <major>1</major>
-        <minor>0</minor>
-        <build>0</build>
-    </version>
-    <devices>
-        <!-- Placeholder for device definitions -->
-    </devices>
-</device-manifest>`;
-
-    res.set('Content-Type', 'application/xml; charset=utf-8');
-    res.send(deviceManifest);
 });
 
 // Main manifest file that might be requested first by the download manager
@@ -5144,10 +5310,6 @@ function createSrbResponse(accountId, loginToken) {
     return response;
 }
 
-function generateUniqueId() {
-    return uuidv4().substring(0, 8);
-}
-
 function generateToken() {
     return crypto.randomBytes(32).toString('hex');
 }
@@ -5240,7 +5402,7 @@ function createUserProfile(accountId, username) {
                 pv: 175,      // point value for Electropod 1.0 from virmon-master-decoded.xml
                 type: "virmon",
                 assetTypeId: 1,
-                assetId: generateUniqueId(),  // Unique instance ID for this specific nanovor (without prefix that might cause parsing issues)
+                assetId: newNanovorAssetId(),  // Unique instance ID; decimal so it can round-trip through a Nanoscope vinfo.bbb
                 productionNumber: 1,
                 birthDate: formatDateForNanovor(new Date()),
                 lastEvolutionDate: formatDateForNanovor(new Date()),
@@ -5283,7 +5445,7 @@ function createUserProfile(accountId, username) {
                 pv: 160,      // point value for Doom Blade 1.0 from virmon-master-decoded.xml
                 type: "virmon",
                 assetTypeId: 24,
-                assetId: generateUniqueId(),  // Unique instance ID for this specific nanovor (without prefix that might cause parsing issues)
+                assetId: newNanovorAssetId(),  // Unique instance ID; decimal so it can round-trip through a Nanoscope vinfo.bbb
                 productionNumber: 1,
                 birthDate: formatDateForNanovor(new Date()),
                 lastEvolutionDate: formatDateForNanovor(new Date()),
@@ -5401,6 +5563,9 @@ function loadUserDataByUsername(username) {
             //    would be filed under the wrong key and every bank call would miss.
             //  * nanovor instance ids used to equal their type id ("1", "24"), so
             //    a second copy of the same nanovor collided on <asset id>.
+            //  * nanovor instance ids used to be 8 hex chars. A Nanoscope stores the
+            //    id as a u64 and the client finds the nanovor by its decimal string,
+            //    so a hex id can never make it onto a device.
             let migrated = false;
             const expectedId = generateAccountId(username);
             if (String(userData.id) !== expectedId) {
@@ -5411,9 +5576,9 @@ function loadUserDataByUsername(username) {
             const seenAssetIds = new Set();
             for (const n of userData.nanovorInventory || []) {
                 const aid = String(n.assetId);
-                if (!n.assetId || aid === String(n.assetTypeId) || seenAssetIds.has(aid)) {
+                if (!/^[1-9]\d*$/.test(aid) || aid === String(n.assetTypeId) || seenAssetIds.has(aid)) {
                     let fresh;
-                    do { fresh = uuidv4().substring(0, 8); } while (seenAssetIds.has(fresh));
+                    do { fresh = newNanovorAssetId(); } while (seenAssetIds.has(fresh));
                     console.log(`Migrating ${username}: nanovor ${n.name} instance id ${n.assetId} -> ${fresh}`);
                     n.assetId = fresh;
                     migrated = true;

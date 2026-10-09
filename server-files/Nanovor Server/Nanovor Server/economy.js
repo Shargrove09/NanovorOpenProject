@@ -16,6 +16,7 @@
 //   - Wave 1 = 68 nanovor over trees 1-12, Wave 2 = 54 over trees 14-25.
 // ---------------------------------------------------------------------------
 
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { getAllEms, getAllVirmon } = require('./evolutionData');
 
@@ -185,13 +186,21 @@ function rollPack(baseDir, packId) {
 // (YYYY-MM-DDTHH:MM:SS.mmm+HH:MM). MakeDate.dateFromBankTime returns null for
 // anything else and the client dereferences it without a guard.
 
+// Nanovor asset ids must be plain decimal. On a Nanoscope the id is a u64 inside
+// vinfo.bbb, which the client turns back into a decimal string and looks up
+// verbatim (DeviceNanovorRetriever). Original ids were ~4.6M; these start at 1e9
+// so they never collide, and stay under 2^31 in case anything casts to int.
+function newNanovorAssetId() {
+    return String(crypto.randomInt(1e9, 2 ** 31 - 1));
+}
+
 function mintNanovor(master, now) {
     return {
         id: master.assetTypeId,
         name: master.name,
         type: 'virmon',
         assetTypeId: master.assetTypeId,
-        assetId: uuidv4().substring(0, 8), // unique per instance
+        assetId: newNanovorAssetId(), // unique per instance
         faction: master.faction,
         rarity: master.rarity,
         wave: master.wave,
@@ -263,6 +272,7 @@ module.exports = {
     GIFT_BY_VALUE,
     rollPack,
     grantToUser,
+    newNanovorAssetId,
     mintNanovor,
     mintEm,
     buildSkuListXml,

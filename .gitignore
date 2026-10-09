@@ -29,6 +29,11 @@ server-files/Nanovor Server/Nanovor Server/Manifests/
 # Standalone Flash Player used by run-debuglog.bat
 flashplayer_32_sa.exe
 
+# --- Nanoscope (vendor firmware, per-device signed blobs, personal data) ---
+/firmware/
+device-backups/
+DeviceVault/
+
 # --- Claude Code / agents ---
 # Ignore only per-user / local state.
 CLAUDE.local.md
