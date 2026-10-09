@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://127.0.0.1:8443/xsd/account/account-profile.xsd"
+           xmlns:tns="http://127.0.0.1:8443/xsd/account/account-profile.xsd"
+           elementFormDefault="qualified">
+
+    <xs:element name="account-profile">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="phone-number" type="xs:string" minOccurs="0"/>
+                <xs:element name="avatar-id" type="xs:int"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+
+</xs:schema>

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://127.0.0.1:8443/xsd/shard/shard-list.xsd"
+           xmlns:tns="http://127.0.0.1:8443/xsd/shard/shard-list.xsd"
+           elementFormDefault="qualified">
+
+    <xs:element name="shard-list">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="shard" maxOccurs="unbounded">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="name" type="xs:string"/>
+                            <xs:element name="url" type="xs:string"/>
+                            <xs:element name="max-capacity" type="xs:int"/>
+                            <xs:element name="used-capacity" type="xs:int"/>
+                            <xs:element name="nice" type="xs:int"/>
+                            <xs:element name="population" type="xs:string"/>
+                            <xs:element name="locales">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="locale" type="xs:string" maxOccurs="unbounded"/>
+                                    </xs:sequence>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+
+</xs:schema>

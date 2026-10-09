@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://127.0.0.1:8443/xsd/battle/battle-created.xsd"
+           xmlns:tns="http://127.0.0.1:8443/xsd/battle/battle-created.xsd"
+           elementFormDefault="qualified">
+
+    <xs:element name="battle-created">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="roomId" type="xs:string" minOccurs="0"/>
+                <xs:element name="battle-type" type="xs:string" minOccurs="0"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+</xs:schema>

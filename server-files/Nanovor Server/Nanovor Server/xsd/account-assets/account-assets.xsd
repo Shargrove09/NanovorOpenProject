@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://127.0.0.1:8443/xsd/account-assets/account-assets.xsd"
+           xmlns:tns="http://127.0.0.1:8443/xsd/account-assets/account-assets.xsd"
+           xmlns:ns2="http://127.0.0.1:8443/xsd/asset-miscellany/asset-miscellany.xsd"
+           xmlns:ns3="http://127.0.0.1:8443/xsd/asset-stat/asset-stat.xsd"
+           elementFormDefault="qualified">
+
+    <xs:import namespace="http://127.0.0.1:8443/xsd/asset-miscellany/asset-miscellany.xsd" schemaLocation="../asset-miscellany/asset-miscellany.xsd"/>
+    <xs:import namespace="http://127.0.0.1:8443/xsd/asset-stat/asset-stat.xsd" schemaLocation="../asset-stat/asset-stat.xsd"/>
+
+    <xs:element name="account-assets">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="asset" type="tns:assetType" minOccurs="0" maxOccurs="unbounded"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+
+    <xs:complexType name="assetType">
+        <xs:sequence>
+            <xs:element name="asset-type-category" type="xs:string"/>
+            <xs:element name="asset-type-id" type="xs:integer"/>
+            <xs:element name="asset-type-name" type="xs:string" minOccurs="0"/>
+            <xs:element name="asset-value" type="xs:integer" minOccurs="0"/>
+            <xs:element name="production-number" type="xs:integer"/>
+            <xs:element name="birth-date" type="xs:string"/>
+            <xs:element name="last-evolution-date" type="xs:string"/>
+            <xs:element ref="ns2:asset-miscellany" minOccurs="0"/>
+            <xs:element ref="ns3:asset-stat" minOccurs="0"/>
+        </xs:sequence>
+        <xs:attribute name="id" type="xs:string" use="required"/>
+    </xs:complexType>
+</xs:schema>

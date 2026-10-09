@@ -1,0 +1,58 @@
+# --- Node ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+.env
+.env.*
+!.env.example
+
+# --- Server runtime ---
+server.log
+*.log
+# Live account saves (reset-account.bat restores from UserData.orig-backup, which stays tracked)
+server-files/Nanovor Server/Nanovor Server/UserData/
+# Stale single-file backup made before the repo was under version control
+*.orig-backup
+
+# The pristine UserData backup must stay tracked
+!UserData.orig-backup/
+!**/UserData.orig-backup/
+
+# --- Game client & assets (~2.5 GiB, copyrighted; distributed separately) ---
+# Pristine reference client
+/Nanovor/
+# Running client copy and the served asset tree
+server-files/Nanovor Server/Nanovor Server/Nanovor/
+server-files/Nanovor Server/Nanovor Server/Manifests/
+# Standalone Flash Player used by run-debuglog.bat
+flashplayer_32_sa.exe
+
+# --- Claude Code / agents ---
+# Ignore only per-user / local state.
+CLAUDE.local.md
+AGENTS.local.md
+.claude/settings.local.json
+.claude/scratchpad/
+.claude/worktrees/
+
+
+# --- IDE / editor ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# --- Temp ---
+*.tmp
+*.bak

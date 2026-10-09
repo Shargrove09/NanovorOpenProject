@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://127.0.0.1:8443/xsd/evolution/evolution-attempt.xsd"
+           xmlns:tns="http://127.0.0.1:8443/xsd/evolution/evolution-attempt.xsd"
+           elementFormDefault="qualified">
+
+    <xs:element name="evolution-attempt">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="source-asset-id" type="xs:string"/>
+                <xs:element name="em-asset-id" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+
+</xs:schema>

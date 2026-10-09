@@ -1,0 +1,15 @@
+package com.arkadium.virmon.shared.elements.icons.actions
+{
+   import flash.display.Sprite;
+   
+   [Embed(source="/_assets/assets.swf", symbol="symbol484")]
+   public class ActionAcid extends Sprite
+   {
+      
+      public function ActionAcid()
+      {
+         super();
+      }
+   }
+}
+

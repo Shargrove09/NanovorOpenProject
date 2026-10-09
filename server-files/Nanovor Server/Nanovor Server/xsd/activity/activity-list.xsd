@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://127.0.0.1:8443/xsd/activity/activity-list.xsd"
+           xmlns:tns="http://127.0.0.1:8443/xsd/activity/activity-list.xsd"
+           elementFormDefault="qualified">
+
+    <xs:element name="activity-list">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="activity" minOccurs="0" maxOccurs="unbounded">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="activity-type" type="xs:string"/>
+                            <xs:element name="timestamp" type="xs:dateTime"/>
+                            <xs:element name="metadata" minOccurs="0">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="login-session-duration" type="xs:int" minOccurs="0"/>
+                                        <xs:any minOccurs="0" maxOccurs="unbounded" processContents="lax"/>
+                                    </xs:sequence>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+
+</xs:schema>

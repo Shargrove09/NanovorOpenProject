@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://127.0.0.1:8443/xsd/asset-stat/asset-stat.xsd"
+           xmlns:tns="http://127.0.0.1:8443/xsd/asset-stat/asset-stat.xsd"
+           elementFormDefault="qualified">
+
+    <xs:element name="asset-stat">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="asset-type-id" type="xs:int"/>
+                <xs:element name="speed" type="xs:int"/>
+                <xs:element name="strength" type="xs:int"/>
+                <xs:element name="armor" type="xs:int"/>
+                <xs:element name="health" type="xs:int"/>
+                <xs:element name="kill-count" type="xs:int"/>
+                <xs:element name="kill-count-lifetime" type="xs:int"/>
+                <xs:element name="battle-count" type="xs:int"/>
+                <xs:element name="battle-count-lifetime" type="xs:int"/>
+                <xs:element name="death-count" type="xs:int"/>
+                <xs:element name="death-count-lifetime" type="xs:int"/>
+                <xs:element name="magnamod-kill-count" type="xs:int"/>
+                <xs:element name="magnamod-kill-count-lifetime" type="xs:int"/>
+                <xs:element name="hexite-kill-count" type="xs:int"/>
+                <xs:element name="hexite-kill-count-lifetime" type="xs:int"/>
+                <xs:element name="velocitron-kill-count" type="xs:int"/>
+                <xs:element name="velocitron-kill-count-lifetime" type="xs:int"/>
+                <xs:element name="win-count" type="xs:int"/>
+                <xs:element name="win-count-lifetime" type="xs:int"/>
+                <xs:element name="critical-hit-count" type="xs:int"/>
+                <xs:element name="whiff-count" type="xs:int"/>
+                <xs:element name="screen-star" type="xs:boolean"/>
+                <xs:element name="scraped-by" type="xs:boolean"/>
+                <xs:element name="all-attacks-used" type="xs:boolean"/>
+                <xs:element name="slacker" type="xs:boolean"/>
+                <xs:element name="max-damage-game" type="xs:int"/>
+                <xs:element name="max-damage-hit" type="xs:int"/>
+                <xs:element name="max-round-count" type="xs:int"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+</xs:schema>

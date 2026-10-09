@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://127.0.0.1:8443/xsd/battle/swarm-set.xsd"
+           xmlns:tns="http://127.0.0.1:8443/xsd/battle/swarm-set.xsd"
+           elementFormDefault="qualified">
+
+    <xs:element name="swarm-set">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="status" type="xs:string"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+</xs:schema>

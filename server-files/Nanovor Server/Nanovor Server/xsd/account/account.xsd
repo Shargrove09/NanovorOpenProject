@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://127.0.0.1:8443/xsd/account/account.xsd"
+           xmlns:tns="http://127.0.0.1:8443/xsd/account/account.xsd"
+           elementFormDefault="qualified">
+
+    <xs:element name="account">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="username" type="xs:string"/>
+                <xs:element name="screenname" type="xs:string"/>
+                <xs:element name="email-address" type="xs:string"/>
+                <xs:element name="phone-number" type="xs:string" minOccurs="0"/>
+                <xs:element name="avatar-id" type="xs:int"/>
+                <xs:element name="token-balance" type="xs:int"/>
+                <xs:element name="jolt_health_balance" type="xs:int"/>
+                <xs:element name="jolt_armor_balance" type="xs:int"/>
+                <xs:element name="jolt_strength_balance" type="xs:int"/>
+                <xs:element name="jolt_speed_balance" type="xs:int"/>
+                <xs:element name="virmon-master-rating" type="xs:int"/>
+                <xs:element name="games-played" type="xs:int"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+
+</xs:schema>
