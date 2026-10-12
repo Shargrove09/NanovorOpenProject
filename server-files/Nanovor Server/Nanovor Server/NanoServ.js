@@ -34,6 +34,16 @@ const {
     newNanovorAssetId,
     buildSkuListXml,
 } = require('./economy');
+// Server-side combat: a faithful port of the client's own BattleLogic, plus the
+// Sensei AI that drives the opponent. See battle.js / battleAI.js headers for the
+// decompiled file:line references each rule came from.
+const { BattleNanovor, BattleEngine, NMP_DELTA } = require('./battle');
+const { SenseiAI, getSenseiRoster, buildSenseiSwarm } = require('./battleAI');
+// Roster entry driving createQuickBattle's single AI opponent. No difficulty-
+// select step exists in the quick-battle client flow (that's a separate,
+// fully client-side Sensei-only screen), so this is a judgment call, kept
+// swappable - see AGENTS.local.md / the Slice 2 plan, item 2.
+const QUICK_BATTLE_AI_ROSTER_ID = '-4'; // "Medium"
 // Nanoscope handheld: on-device file formats and the vault of captured signed files
 const nanoscope = require('./nanoscope');
 const deviceVault = new nanoscope.DeviceVault(path.join(__dirname, 'DeviceVault'));
@@ -1290,33 +1300,126 @@ app.post('/bankfe/resources/account/:accountId/profile', (req, res) => {
     res.send(response);
 });
 
-// Asset jolt spend endpoint
+// Asset jolt spend endpoint.
+//
+// Request body (NanovorBuffController.as / ServiceRequestBrokerManager.as:361):
+//   <jolt-spend><armor-delta>N</armor-delta><health-delta>N</health-delta>
+//               <speed-delta>N</speed-delta><strength-delta>N</strength-delta></jolt-spend>
+// Deltas are POINT COUNTS (how many +1 steps to buy), not jolt amounts - the client
+// reads the per-step jolt cost itself from the buff-formula-* ladders, so the server
+// must do the same lookup to know what to charge.
+//
+// Response is read by NanovorBuffController.onJoltSuccess as a plain XML element
+// (any root name other than "error"). The client applies the update ONLY if
+// <asset-stat id> equals the posted asset id AND <account id> equals the profile
+// id - a response missing or mismatching either is silently discarded, which is
+// why the old stub "succeeded" but visibly changed nothing.
 app.post('/bankfe/resources/asset/:assetId/jolt', (req, res) => {
     const assetId = req.params.assetId;
     const auth = req.query.auth;
+    const body = req.body ? req.body.toString() : '';
 
-    console.log(`[${new Date().toISOString()}] Asset jolt spend request for asset ${assetId}, auth: ${auth}`);
-    console.log(`Request details - Path: ${req.path}, Query:`, req.query, 'Headers:', req.headers, 'Body:', req.body.toString());
+    console.log(`[${new Date().toISOString()}] Asset jolt spend request for asset ${assetId}, auth: ${auth}, body: ${body}`);
 
-    // Verify token
     const session = findSessionByToken(auth);
     if (!session) {
         console.log(`[${new Date().toISOString()}] Invalid token for asset jolt spend request - auth: ${auth}`);
         return res.status(401).send('<error>Invalid token</error>');
     }
 
-    // Parse the jolt spend data from the request
-    const joltSpendData = req.body.toString();
-    console.log(`[${new Date().toISOString()}] Jolt spend data: ${joltSpendData}`);
+    const user = users[session.accountId];
+    if (!user) {
+        return res.status(404).send('<error>User not found</error>');
+    }
 
-    // For now, just acknowledge the request
-    // In a real implementation, you would parse the XML and update the asset's stats
-    console.log(`[${new Date().toISOString()}] Processed jolt spend for asset ${assetId}`);
+    const nanovor = (user.nanovorInventory || []).find(n => String(n.assetId) === String(assetId));
+    if (!nanovor) {
+        console.log(`[${new Date().toISOString()}] Jolt spend: asset ${assetId} not found in ${session.accountId}'s inventory`);
+        return res.status(404).send('<error>Asset not found</error>');
+    }
 
-    // Return success response
-    const response = `<jolt-spend-success xmlns="http://127.0.0.1:8443/xsd/jolt-spend/jolt-spend-success.xsd"/>`;
+    const master = getVirmonMaster(__dirname, nanovor.assetTypeId);
+    if (!master) {
+        console.log(`[${new Date().toISOString()}] Jolt spend: no master data for asset-type-id ${nanovor.assetTypeId}`);
+        return res.status(500).send('<error>No master data for this nanovor type</error>');
+    }
 
-    console.log(`[${new Date().toISOString()}] Sending jolt spend success response for asset ${assetId}`);
+    const intTag = (tag) => {
+        const n = parseInt((body.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`)) || [, '0'])[1], 10);
+        return Number.isFinite(n) && n > 0 ? n : 0;
+    };
+    const deltas = {
+        speed: intTag('speed-delta'),
+        strength: intTag('strength-delta'),
+        armor: intTag('armor-delta'),
+        health: intTag('health-delta'),
+    };
+    if (!deltas.speed && !deltas.strength && !deltas.armor && !deltas.health) {
+        return res.status(400).send('<error>No positive deltas in jolt-spend request</error>');
+    }
+
+    // Per stat: base/max/ladder from master data, current value and jolt pool from
+    // the account. ladder[i] is the cost of the step that takes the stat from
+    // base+i to base+i+1 (CONFIRMED: ladder.length === max - base).
+    const STATS = {
+        speed: { base: master.baseSpeed, max: master.maxSpeed, ladder: master.buffSpeed, pool: 'speedJolts' },
+        strength: { base: master.baseStrength, max: master.maxStrength, ladder: master.buffStrength, pool: 'strengthJolts' },
+        armor: { base: master.baseArmor, max: master.maxArmor, ladder: master.buffArmor, pool: 'armorJolts' },
+        health: { base: master.baseHealth, max: master.maxHealth, ladder: master.buffHealth, pool: 'healthJolts' },
+    };
+
+    const newValues = {};
+    const costs = {};
+    for (const [stat, delta] of Object.entries(deltas)) {
+        const { base, max, ladder, pool } = STATS[stat];
+        const current = typeof nanovor[stat] === 'number' ? nanovor[stat] : base;
+        const target = current + delta;
+        if (delta === 0) { newValues[stat] = current; costs[stat] = 0; continue; }
+        if (target > max) {
+            console.log(`[${new Date().toISOString()}] Jolt spend rejected: ${stat} ${current}+${delta} would exceed max ${max}`);
+            return res.status(400).send(`<error>${stat} delta would exceed max (${target} > ${max})</error>`);
+        }
+        let cost = 0;
+        for (let step = current - base; step < target - base; step++) {
+            cost += ladder[step] ?? 0;
+        }
+        const have = user[pool] || 0;
+        if (cost > have) {
+            console.log(`[${new Date().toISOString()}] Jolt spend rejected: ${stat} needs ${cost} jolts, account has ${have}`);
+            return res.status(400).send(`<error>Not enough ${stat} jolts (need ${cost}, have ${have})</error>`);
+        }
+        newValues[stat] = target;
+        costs[stat] = cost;
+    }
+
+    // All stats validated - apply.
+    for (const [stat, { pool }] of Object.entries(STATS)) {
+        if (costs[stat]) user[pool] = (user[pool] || 0) - costs[stat];
+        if (deltas[stat]) nanovor[stat] = newValues[stat];
+    }
+    saveUserData(session.accountId);
+
+    console.log(`[${new Date().toISOString()}] Jolt spend OK for ${nanovor.name} (${assetId}): ` +
+        `speed ${deltas.speed ? `+${deltas.speed} (-${costs.speed})` : '-'}, ` +
+        `strength ${deltas.strength ? `+${deltas.strength} (-${costs.strength})` : '-'}, ` +
+        `armor ${deltas.armor ? `+${deltas.armor} (-${costs.armor})` : '-'}, ` +
+        `health ${deltas.health ? `+${deltas.health} (-${costs.health})` : '-'}`);
+
+    const response = `<jolt-spend-success>
+  <asset-stat id="${assetId}">
+    <armor>${nanovor.armor}</armor>
+    <health>${nanovor.health}</health>
+    <speed>${nanovor.speed}</speed>
+    <strength>${nanovor.strength}</strength>
+  </asset-stat>
+  <account id="${session.accountId}">
+    <jolt_health_balance>${user.healthJolts || 0}</jolt_health_balance>
+    <jolt_armor_balance>${user.armorJolts || 0}</jolt_armor_balance>
+    <jolt_strength_balance>${user.strengthJolts || 0}</jolt_strength_balance>
+    <jolt_speed_balance>${user.speedJolts || 0}</jolt_speed_balance>
+  </account>
+</jolt-spend-success>`;
+
     res.set('Content-Type', 'application/xml');
     res.send(response);
 });
@@ -1489,6 +1592,12 @@ app.post('/bankfe/resources/evolution/:evolutionId', (req, res) => {
     if (destination) {
         source.name = destination.name;
         source.faction = destination.faction;
+        // Reset stats to the new type's base (evolving replaces the creature, so prior
+        // jolts don't carry over). Falls back to current values if master lacks them.
+        source.speed = destination.baseSpeed || source.speed || 0;
+        source.strength = destination.baseStrength || source.strength || 0;
+        source.armor = destination.baseArmor ?? source.armor ?? 0;
+        source.health = destination.baseHealth || source.health || 0;
     }
     source.lastEvolutionDate = formatDateForNanovor(new Date());
     // Per-evolution counters reset; the *-lifetime ones deliberately do not.
@@ -3701,13 +3810,85 @@ function broadcastToBattle(battleName, message, excludeUserId = null) {
     }
 }
 
+// Builds one gameXt response/push frame from a plain object (must include
+// _cmd). JSON.stringify guarantees valid, correctly-escaped JSON inside the
+// CDATA - the legacy gameXt cases hand-interpolate strings instead, which is
+// fragile the moment a username or other field contains a quote. The
+// `xmlXtToJsonFrame` shim installed on every socket (see its own comment)
+// re-encodes this same `<msg t="xt">...<![CDATA[...]]>` shape into the real
+// wire JSON frame, so this keeps the file's one established send pattern.
+function battleXtFrame(cmdObj) {
+    return `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[${JSON.stringify(cmdObj)}]]></body></msg>\x00`;
+}
+
+// Applies the battle counters BattleEngine itself already computed (kills,
+// deaths, wins, damage - see battle.js's BattleNanovor/BattlePlayer) to the
+// human side's account and nanovor records once a quick battle ends. The AI
+// side has no account and is skipped. Mirrors the *-lifetime convention
+// already used by evolution (NanoServ.js's resetPlayerStats-on-evolve): the
+// plain counters are this-battle values (overwritten wholesale, matching how
+// they're reset to 0 on evolution elsewhere), the *Lifetime*/*-lifetime ones
+// only ever accumulate.
+function persistBattleResult(battleRoom, engine, over) {
+    const humanUserId = battleRoom.humanUserId;
+    const user = users[humanUserId];
+    if (!user) return;
+
+    const human = engine.getPlayerByUserRefId(humanUserId);
+    if (!human) return;
+    const won = over.winnerId === String(humanUserId);
+
+    user.gamesPlayed = (user.gamesPlayed || 0) + 1;
+    if (won) user.gamesWon = (user.gamesWon || 0) + 1;
+    user.totalKills = (user.totalKills || 0) + human.killCount;
+    user.hexiteKills = (user.hexiteKills || 0) + human.hexiteKillCount;
+    user.magnamodKills = (user.magnamodKills || 0) + human.magnamodKillCount;
+    user.velocitronKills = (user.velocitronKills || 0) + human.velocitronKillCount;
+    // RECONSTRUCTED - see battle.js's NMP_DELTA header comment: no source for
+    // nmpDiff exists anywhere in the decompiled client.
+    user.nmp = (user.nmp || 0) + (won ? NMP_DELTA.WIN : NMP_DELTA.LOSS);
+
+    for (const bn of human.swarm) {
+        const inv = (user.nanovorInventory || []).find(n => String(n.assetId) === bn.assetId);
+        if (!inv) continue;
+        inv.killCount = (inv.killCount || 0) + bn.killCount;
+        inv.lifetimeKillCount = (inv.lifetimeKillCount || 0) + bn.killCount;
+        const played = bn.roundsPlayed > 0 ? 1 : 0;
+        inv.battleCount = (inv.battleCount || 0) + played;
+        inv.lifetimeBattleCount = (inv.lifetimeBattleCount || 0) + played;
+        inv.deathCount = (inv.deathCount || 0) + bn.deathCount;
+        inv.lifetimeDeathCount = (inv.lifetimeDeathCount || 0) + bn.deathCount;
+        inv.magnamodKillCount = (inv.magnamodKillCount || 0) + bn.magnamodKillCount;
+        inv.magnamodLifetimeKillCount = (inv.magnamodLifetimeKillCount || 0) + bn.magnamodKillCount;
+        inv.hexiteKillCount = (inv.hexiteKillCount || 0) + bn.hexiteKillCount;
+        inv.hexiteLifetimeKillCount = (inv.hexiteLifetimeKillCount || 0) + bn.hexiteKillCount;
+        inv.velocitronKillCount = (inv.velocitronKillCount || 0) + bn.velocitronKillCount;
+        inv.velocitronLifetimeKillCount = (inv.velocitronLifetimeKillCount || 0) + bn.velocitronKillCount;
+        inv.winCount = (inv.winCount || 0) + bn.winCount;
+        inv.lifetimeWinCount = (inv.lifetimeWinCount || 0) + bn.winCount;
+        inv.maxDamageHit = Math.max(inv.maxDamageHit || 0, bn.maxDamageHit);
+        inv.maxDamageGame = Math.max(inv.maxDamageGame || 0, bn.totalGameDamage);
+        inv.maxRoundCount = Math.max(inv.maxRoundCount || 0, engine.roundCounter);
+        inv.isScrapedBy = inv.isScrapedBy || bn.scrapedBy;
+        // Deliberately NOT writing bn.hitPoints back to inv.health: no
+        // decompiled source confirms whether battle damage is meant to
+        // persist between battles, and there's no confirmed heal/restore
+        // mechanic yet (see AGENTS.local.md's "Remaining work" - jolts are
+        // stat buffs, not healing). Every nanovor keeps starting each battle
+        // at its stored inventory health, same as before this change; only
+        // the counters BattleLogic itself confirms are applied here.
+    }
+
+    saveUserData(humanUserId);
+}
+
 function handleGameXtCommand(socket, command, params) {
     console.log(`[GAMEXT_LOG] Handling gameXt command: ${command}`, params);
 
     let response = '';
 
     switch (command) {
-        case 'createQuickBattle':
+        case 'createQuickBattle': {
             console.log(`[GAMEXT_LOG] createQuickBattle command called by user ${socket.userId} (${socket.userName})`, params);
             // Create a quick battle with specified parameters
             const gameSwarmValue = params.gameSwarmValue || 1000;
@@ -3715,6 +3896,18 @@ function handleGameXtCommand(socket, command, params) {
 
             // Generate a unique battle name
             const newBattleName = `quick_battle_${Date.now()}_${socket.userId}`;
+
+            // There's no real matchmaking (single-player server) and no
+            // difficulty-select step in the quick-battle client flow - see
+            // QUICK_BATTLE_AI_ROSTER_ID. Fail loudly if the roster data is
+            // somehow missing rather than silently handing back an empty
+            // battle (this project's defining risk - see AGENTS.local.md).
+            const aiRoster = getSenseiRoster(__dirname, QUICK_BATTLE_AI_ROSTER_ID);
+            if (!aiRoster) {
+                console.error(`[GAMEXT_LOG] createQuickBattle failed - no sensei roster for id ${QUICK_BATTLE_AI_ROSTER_ID}`);
+                response = battleXtFrame({ _cmd: 'gameCreationError' });
+                break;
+            }
 
             // Create battle room
             const battleRoom = {
@@ -3729,14 +3922,27 @@ function handleGameXtCommand(socket, command, params) {
                     nanovorSwarm: [],
                     selectedNanovor: null,
                     enemyTarget: null
+                }, {
+                    id: aiRoster.userRefId,
+                    name: aiRoster.name,
+                    ready: true,
+                    nanovorSwarm: [],
+                    selectedNanovor: null,
+                    enemyTarget: null,
+                    isAI: true,
                 }],
                 creator: socket.userId,
                 creatorName: socket.userName,
-                gameState: 'waiting_for_players', // waiting_for_players, in_progress, finished
+                gameState: 'in_progress', // waiting_for_players, in_progress, finished
                 turnOrder: [],
                 currentTurn: 0,
                 round: 1,
-                battleHistory: []
+                battleHistory: [],
+                // Filled in by setSwarm once both sides' swarms are known.
+                aiRoster,
+                humanUserId: socket.userId,
+                engine: null,
+                ai: null,
             };
 
             battleRooms[newBattleName] = battleRoom;
@@ -3744,9 +3950,28 @@ function handleGameXtCommand(socket, command, params) {
             // Update socket's active battle
             socket.activeBattle = newBattleName;
 
-            response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameCreated","battleName":"${newBattleName}","gameCreator":"${socket.userName}","convertedChatRoom":false}]]></body></msg>\x00`;
-            console.log(`[GAMEXT_LOG] createQuickBattle completed, battle created: ${newBattleName}`);
+            // gameCreated (ack) -> playerJoinGame (registers the AI opponent
+            // client-side via IOtherPlayerJoinBattleHandler, exactly as a real
+            // second human would arrive) -> gameStarted (starts the client's
+            // own local countdown into the swarm-chooser screen). Sequence
+            // and field shapes confirmed against SmartFoxBattleGameService.as
+            // and SenseiBattleServerImitator.as (the client's own in-process
+            // stand-in for this same server role) - see battle.js's header.
+            socket.write(battleXtFrame({ _cmd: 'gameCreated', battleName: newBattleName, gameCreator: socket.userName, convertedChatRoom: false }));
+            socket.write(battleXtFrame({
+                _cmd: 'playerJoinGame', battleName: newBattleName,
+                userRefId: aiRoster.userRefId, username: aiRoster.name,
+                avatarId: 0, nmp: 0, creator: false,
+            }));
+            socket.write(battleXtFrame({
+                _cmd: 'gameStarted',
+                players: battleRoom.players.map(p => ({ username: p.name, userRefId: p.id })),
+                gameCreator: socket.userName,
+            }));
+            response = '';
+            console.log(`[GAMEXT_LOG] createQuickBattle completed, battle created: ${newBattleName}, AI opponent: ${aiRoster.name}`);
             break;
+        }
 
         case 'createGame':
             // Create a custom game
@@ -3899,20 +4124,90 @@ function handleGameXtCommand(socket, command, params) {
             }
             break;
 
-        case 'setSwarm':
+        case 'setSwarm': {
             console.log(`[GAMEXT_LOG] setSwarm command called by user ${socket.userId} (${socket.userName})`, params);
-            // Set the player's battle swarm with enhanced validation for NewUserState
-            const nanovorIds = params.nanovorIds ? params.nanovorIds.split(',').map(id => parseInt(id)) : [];
+            // The client sends per-INSTANCE ids here (Nanovor.assetId -
+            // NanovorFactory/VirmonManager.getVirmonData key off assetId, not
+            // the shared species assetTypeId - confirmed by direct source
+            // read; see battle.js header / AGENTS.local.md's "Nanovor asset
+            // ids must be decimal too"). They're decimal strings, not ints -
+            // parseInt() here was comparing against the wrong field entirely
+            // (nano.id, the species id every owned copy shares) and would
+            // have silently matched the wrong nanovor even if the field were
+            // right, so this is a real fix, not just an engine-wiring change.
+            const nanovorIds = params.nanovorIds ? params.nanovorIds.split(',').map(id => id.trim()).filter(Boolean) : [];
             const activeBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
+            if (activeBattle && activeBattle.aiRoster) {
+                // Quick-battle (AI opponent) path: build a real BattleEngine
+                // from both sides' actual swarms instead of just recording ids.
+                const user = users[socket.userId];
+                const validEntries = nanovorIds
+                    .map(id => (user && user.nanovorInventory || []).find(n => String(n.assetId) === id))
+                    .filter(Boolean);
+
+                if (validEntries.length === 0) {
+                    console.log(`[GAMEXT_LOG] setSwarm rejected - no valid nanovor in selection for user ${socket.userId}`);
+                    response = battleXtFrame({ _cmd: 'gameError', errorMessage: 'No valid nanovor in swarm selection' });
+                    break;
+                }
+
+                const humanSwarm = [];
+                for (const entry of validEntries) {
+                    const master = getVirmonMaster(__dirname, entry.assetTypeId);
+                    if (!master) {
+                        console.error(`[GAMEXT_LOG] setSwarm - no master data for asset-type-id ${entry.assetTypeId} (nanovor ${entry.assetId}), skipping`);
+                        continue;
+                    }
+                    humanSwarm.push(new BattleNanovor(master, {
+                        assetId: entry.assetId, name: entry.name, nickname: entry.nickname || '',
+                        speed: entry.speed, strength: entry.strength, armor: entry.armor, health: entry.health,
+                    }));
+                }
+                if (humanSwarm.length === 0) {
+                    response = battleXtFrame({ _cmd: 'gameError', errorMessage: 'No valid nanovor in swarm selection' });
+                    break;
+                }
+
+                const aiSwarm = buildSenseiSwarm(__dirname, activeBattle.aiRoster);
+                const engine = new BattleEngine([
+                    { userRefId: String(socket.userId), username: socket.userName, swarm: humanSwarm },
+                    { userRefId: activeBattle.aiRoster.userRefId, username: activeBattle.aiRoster.name, swarm: aiSwarm },
+                ], Math.random);
+                const ai = new SenseiAI(engine.players[1], engine.players[0], Math.random);
+
+                activeBattle.engine = engine;
+                activeBattle.ai = ai;
+                activeBattle.humanUserId = socket.userId;
+                const playerIndex = activeBattle.players.findIndex(p => p.id === socket.userId);
+                if (playerIndex !== -1) activeBattle.players[playerIndex].nanovorSwarm = validEntries.map(e => e.assetId);
+
+                console.log(`[GAMEXT_LOG] setSwarm accepted - user ${socket.userId} fielded ${humanSwarm.length} nanovor vs AI (${activeBattle.aiRoster.name}) with ${aiSwarm.length}`);
+
+                // receiveSwarm (SenseiBattleServerImitator.as): swarmSelected
+                // for both sides, then readyForTurn - the signal that moves
+                // the client from the swarm-chooser screen into combat.
+                socket.write(battleXtFrame({ _cmd: 'swarmSelected', battleName: activeBattle.name, swarmCount: humanSwarm.length, username: socket.userName, userRefId: String(socket.userId) }));
+                socket.write(battleXtFrame({ _cmd: 'swarmSelected', battleName: activeBattle.name, swarmCount: aiSwarm.length, username: activeBattle.aiRoster.name, userRefId: activeBattle.aiRoster.userRefId }));
+                socket.write(battleXtFrame({ _cmd: 'readyForTurn', nanovorId: -1, isDead: false }));
+                response = '';
+                break;
+            }
+
             if (activeBattle) {
+                // Non-AI path (invite-based multiplayer scaffolding; PvP isn't
+                // functional yet - see AGENTS.local.md). Left as it was before
+                // this change, including its pre-existing `nano.id` species-id
+                // comparison - not touched here since it's unreachable in
+                // practice and out of this slice's scope.
+                const legacyNanovorIds = nanovorIds.map(id => parseInt(id));
                 const playerIndex = activeBattle.players.findIndex(p => p.id === socket.userId);
                 if (playerIndex !== -1) {
                     // Validate that the user actually owns these nanovor
                     const user = users[socket.userId];
                     if (user && user.nanovorInventory) {
                         // Check if all requested nanovor IDs are in the user's inventory
-                        const validNanovorIds = nanovorIds.filter(nanovorId =>
+                        const validNanovorIds = legacyNanovorIds.filter(nanovorId =>
                             user.nanovorInventory.some(nano => nano.id === nanovorId)
                         );
 
@@ -3949,15 +4244,15 @@ function handleGameXtCommand(socket, command, params) {
                         }
                     } else {
                         // User doesn't have inventory data, use basic validation
-                        activeBattle.players[playerIndex].nanovorSwarm = nanovorIds;
-                        console.log(`[GAMEXT_LOG] setSwarm accepted (no inventory validation) - user ${socket.userId} set swarm with ${nanovorIds.length} nanovors`);
+                        activeBattle.players[playerIndex].nanovorSwarm = legacyNanovorIds;
+                        console.log(`[GAMEXT_LOG] setSwarm accepted (no inventory validation) - user ${socket.userId} set swarm with ${legacyNanovorIds.length} nanovors`);
 
                         // Notify other players that this player has set their swarm
-                        const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${nanovorIds.length},"username":"${socket.userName}","userRefId":"${socket.userId}"}]]></body></msg>\x00`;
+                        const swarmSelectedMsg = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${legacyNanovorIds.length},"username":"${socket.userName}","userRefId":"${socket.userId}"}]]></body></msg>\x00`;
 
                         broadcastToBattle(activeBattle.name, swarmSelectedMsg, socket.userId);
 
-                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${nanovorIds.length},"username":"${socket.userName}","userRefId":"${socket.userId}"}]]></body></msg>\x00`;
+                        response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"swarmSelected","battleName":"${activeBattle.name}","swarmCount":${legacyNanovorIds.length},"username":"${socket.userName}","userRefId":"${socket.userId}"}]]></body></msg>\x00`;
                     }
                 } else {
                     console.log(`[GAMEXT_LOG] setSwarm failed - user ${socket.userId} not found in battle ${socket.activeBattle}`);
@@ -3968,6 +4263,7 @@ function handleGameXtCommand(socket, command, params) {
                 response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
             }
             break;
+        }
 
         case 'setSelectedNanovor':
             // Set the selected nanovor for the player
@@ -4018,13 +4314,57 @@ function handleGameXtCommand(socket, command, params) {
             }
             break;
 
-        case 'setAttackInfo':
-            // Set complete attack information
+        case 'setAttackInfo': {
+            const attackBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
+
+            if (attackBattle && attackBattle.engine) {
+                // ICombatTurnData, exactly as the client's own AttackChooser
+                // builds it (CombatTurnData.as): MyNextNanovorId is always a
+                // string, "0" (not null/absent) when not swapping.
+                const humanData = {
+                    AttackId: Number(params.attackId) || 0,
+                    MyActiveNanovorId: String(params.nanovorId),
+                    MyNextNanovorId: params.swapNanovorId != null ? String(params.swapNanovorId) : '0',
+                    TargetedPlayerName: params.enemyUsername,
+                };
+                const engine = attackBattle.engine;
+                engine.receiveCombatTurnData(String(socket.userId), humanData);
+                const aiTurn = attackBattle.ai.getCombatTurnData();
+                const resolved = engine.receiveCombatTurnData(attackBattle.aiRoster.userRefId, aiTurn);
+
+                if (resolved) {
+                    // receiveAttackInfo (SenseiBattleServerImitator.as):
+                    // setRoundInfo -> performAttack -> roundCompleted, then
+                    // gameOver if the round just ended it. One frame per
+                    // step, matching the consumer interface exactly (not one
+                    // performAttack frame per attacker - the imitator sends
+                    // the whole attackResults array in a single call).
+                    const round = engine.getRound();
+                    socket.write(battleXtFrame({ _cmd: 'setRoundInfo', players: round.roundInfo.players, roundCounter: round.roundInfo.roundCounter }));
+                    socket.write(battleXtFrame({ _cmd: 'performAttack', attackResults: round.attackResults }));
+                    socket.write(battleXtFrame({ _cmd: 'roundCompleted', swapActions: round.roundResults.swapActions, players: round.roundResults.players, hacks: round.roundResults.hacks }));
+
+                    const over = engine.getGameOver();
+                    if (over) {
+                        console.log(`[GAMEXT_LOG] battle ${attackBattle.name} over - winner: ${over.winnerId}`);
+                        persistBattleResult(attackBattle, engine, over);
+                        socket.write(battleXtFrame({ _cmd: 'gameOver', winnerId: over.winnerId, results: over.results }));
+                        delete battleRooms[attackBattle.name];
+                        socket.activeBattle = null;
+                    } else {
+                        attackBattle.ai.setRound();
+                    }
+                }
+                response = '';
+                break;
+            }
+
+            // Legacy relay path (non-AI battles; unreachable today - see the
+            // setSwarm comment above). Left as it was before this change.
             const targetPlayerName = params.enemyUsername;
             const myNanovorId = params.nanovorId;
             const setAttackId = params.attackId;
             const swapNanovorId = params.swapNanovorId;
-            const attackBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
             if (attackBattle) {
                 const playerIndex = attackBattle.players.findIndex(p => p.id === socket.userId);
@@ -4060,11 +4400,23 @@ function handleGameXtCommand(socket, command, params) {
                 response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
             }
             break;
+        }
 
-        case 'endRound':
-            // End the current round
+        case 'endRound': {
             const roundBattle = socket.activeBattle ? battleRooms[socket.activeBattle] : null;
 
+            if (roundBattle && roundBattle.engine) {
+                // receiveEndRound (SenseiBattleServerImitator.as): the
+                // client's "round animation finished" signal. Unconditional -
+                // readyForTurn just lets the combat UI accept the next turn's
+                // input; its payload is ignored client-side either way
+                // (BattleCommunications.handleReadyForTurn takes no action on
+                // the params).
+                response = battleXtFrame({ _cmd: 'readyForTurn', nanovorId: -1, isDead: false });
+                break;
+            }
+
+            // Legacy relay path (non-AI battles). Left as it was before this change.
             if (roundBattle) {
                 // Increment round number
                 roundBattle.round++;
@@ -4082,6 +4434,7 @@ function handleGameXtCommand(socket, command, params) {
                 response = `<msg t="xt"><body action="xtRes" r="-1"><![CDATA[{"_cmd":"gameError"}]]></body></msg>\x00`;
             }
             break;
+        }
 
         case 'quitGame':
             console.log(`[GAMEXT_LOG] quitGame command called by user ${socket.userId} (${socket.userName})`, params);
@@ -5584,6 +5937,22 @@ function loadUserDataByUsername(username) {
                     migrated = true;
                 }
                 seenAssetIds.add(String(n.assetId));
+
+                // Backfill stats for nanovor minted before mintNanovor seeded them
+                // (they'd otherwise report the 10/100/5/100 defaults and break jolting).
+                // Nanoscope-imported nanovor already carry their device stats - leave those.
+                if (n.source !== 'nanoscope' &&
+                    [n.speed, n.strength, n.armor, n.health].some(v => typeof v !== 'number')) {
+                    const master = getVirmonMaster(__dirname, n.assetTypeId);
+                    if (master) {
+                        n.speed = typeof n.speed === 'number' ? n.speed : (master.baseSpeed || 0);
+                        n.strength = typeof n.strength === 'number' ? n.strength : (master.baseStrength || 0);
+                        n.armor = typeof n.armor === 'number' ? n.armor : (master.baseArmor || 0);
+                        n.health = typeof n.health === 'number' ? n.health : (master.baseHealth || 0);
+                        console.log(`Migrating ${username}: seeded stats for ${n.name} (${n.speed}/${n.strength}/${n.armor}/${n.health})`);
+                        migrated = true;
+                    }
+                }
             }
 
             // Use the username's account ID to store in the users object

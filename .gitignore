@@ -33,6 +33,8 @@ flashplayer_32_sa.exe
 /firmware/
 device-backups/
 DeviceVault/
+# Community tool + its bundled pre-signed nanovor/firmware (same vendor-binary category as /firmware/)
+/_Project Nanoscope Manager/
 
 # --- Claude Code / agents ---
 # Ignore only per-user / local state.

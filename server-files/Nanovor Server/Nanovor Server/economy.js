@@ -208,6 +208,13 @@ function mintNanovor(master, now) {
         birthDate: now,
         lastEvolutionDate: now,
         nickname: '',
+        // Start at the type's base stats. Without these the asset list falls back
+        // to 10/100/5/100 for every nanovor and jolt-buffing can't work. getVirmonMaster
+        // supplies base-* (0 for the rare type that lacks them in master data).
+        speed: master.baseSpeed || 0,
+        strength: master.baseStrength || 0,
+        armor: master.baseArmor || 0,
+        health: master.baseHealth || 0,
     };
 }
 

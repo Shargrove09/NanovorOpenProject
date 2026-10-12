@@ -45,6 +45,24 @@ function firstTag(block, tag) {
     return m ? m[1].trim() : '';
 }
 
+function intTag(block, tag, fallback = 0) {
+    const n = parseInt(firstTag(block, tag), 10);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+// All repeated <tag> values in document order, as ints. Used for the
+// <buff-formula-*> jolt-cost ladders (one entry per +1 point from base to max).
+function intTags(block, tag) {
+    const out = [];
+    const re = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'g');
+    let m;
+    while ((m = re.exec(block)) !== null) {
+        const n = parseInt(m[1], 10);
+        if (Number.isFinite(n)) out.push(n);
+    }
+    return out;
+}
+
 function xmlEscape(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -69,6 +87,118 @@ function loadMasterXml(baseDir) {
     return out.toString('utf8');
 }
 
+// --- combat attacks -----------------------------------------------------------
+//
+// Parses each <virmon>'s <attack id="N"> children for the battle engine
+// (battle.js). Field-complete against the decompiled client's own parsers:
+//   BattleLogicAttack.parseXMLData            (Decompiled Client SWF/.../
+//   BattleLogicAttackStatement.parseAttackStatement   battlelogic/nanovor/*.as)
+//
+// Duration strings -> ints (BattleLogicAttackStatement.setDurationFromString,
+// CONFIRMED off-by-one: "N active rounds" -> N+1):
+const DURATION = {
+    'None': 0,
+    'Until end of this round': 1,
+    '1 active round': 2,
+    '2 active rounds': 3,
+    '3 active rounds': 4,
+    '4 active rounds': 5,
+    '5 active rounds': 6,
+    '6 active rounds': 7,
+    '7 active rounds': 8,
+    '8 active rounds': 9,
+    '9 active rounds': 10,
+    '10 active rounds': 11,
+    'Permanent': 10000,
+};
+
+// A <conditional>/<conditional-N>/<round-conditional-N> wrapper element, always
+// holding exactly one <conditional-name>/<conditional-mod>/<conditional-var>.
+// BattleLogicConditional's constructor lowercases name and mod on construction -
+// do the same here so the evaluator never has to.
+function parseConditionalBlock(block) {
+    return {
+        name: firstTag(block, 'conditional-name').toLowerCase() || 'no conditions',
+        mod: firstTag(block, 'conditional-mod').toLowerCase(),
+        value: firstTag(block, 'conditional-var'),
+    };
+}
+
+// All <conditional-1> through <conditional-10> (or <round-conditional-N>)
+// children present, each holding one conditional block, in order.
+function parseNumberedConditionals(block, prefix) {
+    const out = [];
+    for (let i = 1; i <= 10; i++) {
+        const m = block.match(new RegExp(`<${prefix}-${i}>([\\s\\S]*?)</${prefix}-${i}>`));
+        if (m) out.push(parseConditionalBlock(m[1]));
+    }
+    return out;
+}
+
+function parseAttackStatement(block, attackId) {
+    return {
+        id: intTag(block, 'id', NaN), // overwritten by caller from the id="" attribute
+        attackId,
+        name: firstTag(block, 'attack-statement-name'),
+        type: firstTag(block, 'type'),
+        target: firstTag(block, 'target'),
+        stat: firstTag(block, 'stat'),
+        verb: firstTag(block, 'verb'),
+        delay: firstTag(block, 'delay'),
+        duration: DURATION[firstTag(block, 'duration')] ?? 0,
+        baseDamageFormula: firstTag(block, 'base-damage-formula') || '0',
+        statementFormula: firstTag(block, 'statement-formula') || '0',
+        // conditional-N gates whether THIS USE of the statement takes effect
+        // (BattleLogicAttackStatement.doesApply); round-conditional-N gates
+        // whether an already-active hack/override still applies THIS round
+        // (doesApplyThisRound) - these are two distinct mechanics, not aliases.
+        conditionals: parseNumberedConditionals(block, 'conditional'),
+        roundConditionals: parseNumberedConditionals(block, 'round-conditional'),
+    };
+}
+
+function parseAttacks(virmonBlock) {
+    const attacks = [];
+    const re = /<attack id="(\d+)">([\s\S]*?)<\/attack>/g;
+    let m;
+    while ((m = re.exec(virmonBlock)) !== null) {
+        const id = parseInt(m[1], 10);
+        const b = m[2];
+
+        // Only the FIRST <conditional> is usable (BattleLogicAttack.parseXMLData's
+        // loop re-reads index 0 every iteration regardless of how many exist -
+        // CONFIRMED decompiler/source quirk; harmless since real data never has
+        // more than one anyway).
+        const condMatch = b.match(/<conditional>([\s\S]*?)<\/conditional>/);
+
+        const statements = [];
+        const stRe = /<attack-statement id="(\d+)">([\s\S]*?)<\/attack-statement>/g;
+        let sm;
+        while ((sm = stRe.exec(b)) !== null) {
+            const st = parseAttackStatement(sm[2], id);
+            st.id = parseInt(sm[1], 10);
+            statements.push(st);
+        }
+
+        attacks.push({
+            id,
+            name: firstTag(b, 'attack-name'),
+            type: firstTag(b, 'type'),
+            shortDesc: firstTag(b, 'short-in-combat-description'),
+            pcDesc: firstTag(b, 'pc-description'),
+            overrideDesc: firstTag(b, 'override-description'),
+            hackDesc: firstTag(b, 'hack-description'),
+            forceDamage: firstTag(b, 'force-damage'),
+            keyword1: firstTag(b, 'keyword-1'),
+            keyword2: firstTag(b, 'keyword-2'),
+            cost: intTag(b, 'cost'),
+            conditional: condMatch ? parseConditionalBlock(condMatch[1]) : null,
+            statements,
+        });
+    }
+    return attacks;
+}
+
 function parseVirmonMaster(xml) {
     const list = [];
     const re = /<virmon>([\s\S]*?)<\/virmon>/g;
@@ -91,6 +221,25 @@ function parseVirmonMaster(xml) {
             wave: firstTag(b, 'wave'),
             rarity: firstTag(b, 'rarity'),
             level: firstTag(b, 'level'),
+            pv: intTag(b, 'pv'),
+            // Base stats (a freshly minted/evolved nanovor starts here) and the max
+            // each stat can be jolted to. Consumed by mintNanovor and the jolt-spend route.
+            baseSpeed: intTag(b, 'base-speed'),
+            baseStrength: intTag(b, 'base-strength'),
+            baseArmor: intTag(b, 'base-armor'),
+            baseHealth: intTag(b, 'base-health'),
+            maxSpeed: intTag(b, 'max-speed'),
+            maxStrength: intTag(b, 'max-strength'),
+            maxArmor: intTag(b, 'max-armor'),
+            maxHealth: intTag(b, 'max-health'),
+            // Jolt-cost ladders: ladder[i] is the cost to raise the stat from
+            // base+i to base+i+1. Length == max - base (CONFIRMED in master data).
+            buffSpeed: intTags(b, 'buff-formula-speed'),
+            buffStrength: intTags(b, 'buff-formula-strength'),
+            buffArmor: intTags(b, 'buff-formula-armor'),
+            buffHealth: intTags(b, 'buff-formula-health'),
+            // Full combat move set, for the battle engine (battle.js).
+            attacks: parseAttacks(b),
         });
     }
     return list;
@@ -385,6 +534,9 @@ const getAllVirmon = baseDir => build(baseDir).virmon.slice();
 // Wiki/recipe notation ("1M1", "2H2") -> the EM master record
 const getEmByShortName = (baseDir, shortName) => build(baseDir).emByShortName.get(shortName) || null;
 
+// A type's full attack/attack-statement tree, for battle.js.
+const getAttacksForType = (baseDir, assetTypeId) => getVirmonMaster(baseDir, assetTypeId)?.attacks || [];
+
 module.exports = {
     getEvolutionListXml,
     getEvolutionById,
@@ -393,5 +545,6 @@ module.exports = {
     getEmByShortName,
     getAllEms,
     getAllVirmon,
+    getAttacksForType,
     xmlEscape,
 };
