@@ -33,6 +33,8 @@ flashplayer_32_sa.exe
 /firmware/
 device-backups/
 DeviceVault/
+# Shared corpus of pre-signed vinfo blobs (ingested from The List / dumps) - copyrighted vendor binaries
+Corpus/
 # Community tool + its bundled pre-signed nanovor/firmware (same vendor-binary category as /firmware/)
 /_Project Nanoscope Manager/
 

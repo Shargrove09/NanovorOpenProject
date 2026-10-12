@@ -47,6 +47,10 @@ const QUICK_BATTLE_AI_ROSTER_ID = '-4'; // "Medium"
 // Nanoscope handheld: on-device file formats and the vault of captured signed files
 const nanoscope = require('./nanoscope');
 const deviceVault = new nanoscope.DeviceVault(path.join(__dirname, 'DeviceVault'));
+// Shared, device-agnostic store of signed vinfos (The List + dumps). The vinfo
+// MAC key is global, so these replay onto any device; it backstops the per-device
+// vault so adopted nanovor the device never physically held can still transfer.
+const corpusVault = new nanoscope.CorpusVault(path.join(__dirname, 'Corpus'));
 const DEVICE_CHARACTERS_DIR = path.join(__dirname, 'Manifests', 'device', 'Characters');
 
 // Initialize Express app
@@ -2184,14 +2188,18 @@ app.get('/device/:deviceId/asset/:assetId/sign/vinfo', (req, res) => {
         console.log(`[nanoscope] sign/vinfo: asset ${assetId} is not in ${ctx.accountId}'s collection`);
         return res.status(404).send('<error>No such asset</error>');
     }
-    const blob = deviceVault.getVinfo(deviceId, assetId);
+    // Per-device capture first (exact bytes that came off this device), then the
+    // shared corpus (any validly-signed vinfo - the MAC key is global, so the
+    // device's firmware accepts it regardless of which device originally made it).
+    let blob = deviceVault.getVinfo(deviceId, assetId);
+    let source = 'device vault';
+    if (!blob) { blob = corpusVault.getVinfo(assetId); source = 'corpus'; }
     if (!blob) {
-        console.log(`[nanoscope] sign/vinfo: NO SIGNED COPY of asset ${assetId} for device ${deviceId}. ` +
-            'Only nanovor imported from this device can go back onto it. The client has already ' +
-            'cleared v1..v10 - restore them with nanoscope-cli.');
+        console.log(`[nanoscope] sign/vinfo: NO SIGNED COPY of asset ${assetId} (device vault or corpus). ` +
+            'The client has already cleared v1..v10 - restore them with nanoscope-cli.');
         return res.status(409).send('<error>No signed copy for this device</error>');
     }
-    console.log(`[nanoscope] sign/vinfo: replaying captured vinfo for asset ${assetId} to device ${deviceId}`);
+    console.log(`[nanoscope] sign/vinfo: replaying ${source} vinfo for asset ${assetId} to device ${deviceId}`);
     res.set('Content-Type', 'application/octet-stream');
     res.send(blob);
 });
@@ -2313,6 +2321,94 @@ app.post('/dev/nanoscope/import', (req, res) => {
         plyinfoVaulted: Boolean(snap.plyinfo),
         nanovor: report,
     });
+});
+
+// ---------------------------------------------------------------------------
+// Dev: "adopt" nanovor from the shared signed corpus into an account. Mints a
+// collection entry per corpus vinfo (using the vinfo's embedded assetId VERBATIM
+// - it is inside the signed payload and must match on device readback) with the
+// stats baked into that blob. Adopted nanovor then show in the collection and
+// the device swarm chooser, and - because the MAC key is global - transfer onto
+// any 1.381 device via the sign/vinfo corpus fallback.
+//
+// Loopback-only, unauthenticated. Body (one of all/types/assetIds):
+//   POST /dev/nanoscope/adopt {"account":"...","all":true}
+//   POST /dev/nanoscope/adopt {"account":"...","types":[24,27]}       // all tiers of those types
+//   POST /dev/nanoscope/adopt {"account":"...","assetIds":["157091847"]}
+// ---------------------------------------------------------------------------
+app.post('/dev/nanoscope/adopt', (req, res) => {
+    const remote = req.socket.remoteAddress || '';
+    if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(remote)) {
+        console.warn(`[dev] rejected nanoscope adopt from non-loopback address ${remote}`);
+        return res.status(403).json({ error: 'dev endpoints are loopback-only' });
+    }
+    const { account, all, types, assetIds } = req.body || {};
+    const user = users[account];
+    if (!user) return res.status(404).json({ error: `no such account: ${account}`, known: Object.keys(users) });
+
+    // Index the corpus: assetId -> parsed vinfo.
+    const index = [];
+    for (const id of corpusVault.listAssetIds()) {
+        const buf = corpusVault.getVinfo(id);
+        if (!buf) continue;
+        try { index.push({ assetId: id, parsed: nanoscope.parseVinfo(buf) }); } catch { /* skip */ }
+    }
+
+    let chosen;
+    if (all) chosen = index;
+    else if (Array.isArray(types) && types.length) {
+        const want = new Set(types.map(Number));
+        chosen = index.filter(e => want.has(e.parsed.assetTypeId));
+    } else if (Array.isArray(assetIds) && assetIds.length) {
+        const want = new Set(assetIds.map(String));
+        chosen = index.filter(e => want.has(e.assetId));
+    } else {
+        return res.status(400).json({ error: 'specify one of: all:true, types:[...], or assetIds:[...]', corpusTypes: [...new Set(index.map(e => e.parsed.assetTypeId))].sort((a, b) => a - b) });
+    }
+    if (!chosen.length) return res.status(404).json({ error: 'nothing in the corpus matched the request' });
+
+    if (!user.nanovorInventory) user.nanovorInventory = [];
+    const now = formatDateForNanovor(new Date());
+    const report = [];
+    for (const { assetId, parsed: p } of chosen) {
+        const master = getVirmonMaster(__dirname, p.assetTypeId);
+        if (!master) { report.push({ assetId, error: `unknown asset-type-id ${p.assetTypeId}` }); continue; }
+
+        let inst = user.nanovorInventory.find(x => String(x.assetId) === assetId);
+        const adopted = !inst;
+        if (!inst) {
+            inst = {
+                id: p.assetTypeId,
+                name: master.name,
+                type: 'virmon',
+                assetTypeId: p.assetTypeId,
+                assetId, // verbatim: inside the signed vinfo payload
+                faction: master.faction,
+                rarity: master.rarity,
+                wave: master.wave,
+                productionNumber: 1,
+                birthDate: now,
+                lastEvolutionDate: now,
+                nickname: '',
+                source: 'nanoscope',
+            };
+            user.nanovorInventory.push(inst);
+        }
+        Object.assign(inst, { speed: p.speed, strength: p.strength, armor: p.armor, health: p.health });
+        report.push({
+            assetId,
+            name: master.name,
+            assetTypeId: p.assetTypeId,
+            adopted, // false = already owned (skipped, not re-id'd)
+            deviceReady: fs.existsSync(path.join(DEVICE_CHARACTERS_DIR, String(p.assetTypeId), 'manifest.xml')),
+        });
+    }
+    saveUserData(account);
+
+    const added = report.filter(r => r.adopted).length;
+    console.log(`[dev] adopted ${added} new corpus nanovor into ${account} (${report.length} requested, ` +
+        `${report.filter(r => r.deviceReady).length} device-ready)`);
+    res.json({ adopted: added, requested: report.length, nanovor: report });
 });
 
 // Manifest endpoints for version checking and updates

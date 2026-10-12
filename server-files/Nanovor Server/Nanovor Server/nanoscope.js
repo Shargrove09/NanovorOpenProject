@@ -241,6 +241,61 @@ class DeviceVault {
     }
 }
 
+// --- corpus: a shared, device-agnostic store of signed vinfos -----------------
+//
+// The vinfo MAC key is GLOBAL: the same payload carries the same 16-byte
+// signature on every device and across firmware 1.20-1.381 (proven by the
+// sample corpus - identical sensei vinfos everywhere, and player vinfos whose
+// payload matches across different devices share one signature). So a
+// validly-signed vinfo captured ANYWHERE can be replayed to ANY device. The
+// corpus holds such blobs keyed by assetId only (no device dir):
+//
+//   <corpusRoot>/vinfo/<assetId>.bbb
+//
+// This is how the server serves nanovor the current device never physically
+// held - the device's firmware validates the signature, not its origin.
+
+class CorpusVault {
+    constructor(corpusRoot) {
+        this.root = corpusRoot;
+    }
+
+    vinfoPath(assetId) {
+        return path.join(this.root, 'vinfo', `${assetId}.bbb`);
+    }
+
+    // Validates size (via parseVinfo) and stores by the vinfo's embedded assetId.
+    // Never re-ids: the assetId is inside the signed payload. Returns the assetId.
+    ingestVinfo(buf) {
+        const { assetId } = parseVinfo(buf);
+        const file = this.vinfoPath(assetId);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, buf);
+        return assetId;
+    }
+
+    getVinfo(assetId) {
+        if (!/^\d+$/.test(String(assetId))) return null;
+        return readIfExists(this.vinfoPath(assetId));
+    }
+
+    has(assetId) {
+        return /^\d+$/.test(String(assetId)) && fs.existsSync(this.vinfoPath(assetId));
+    }
+
+    // Decimal assetIds currently held.
+    listAssetIds() {
+        try {
+            return fs.readdirSync(path.join(this.root, 'vinfo'))
+                .filter(f => /^\d+\.bbb$/.test(f))
+                .map(f => f.replace(/\.bbb$/, ''));
+        } catch (err) {
+            if (err.code === 'ENOENT') return [];
+            throw err;
+        }
+    }
+}
+
 // --- device character assets ----------------------------------------------------
 //
 // /device/characters/<typeId>/{manifest.xml,spr.v2z,nano.snd} are per TYPE. The
@@ -295,6 +350,7 @@ module.exports = {
     parsePlyinfo,
     readDeviceRoot,
     DeviceVault,
+    CorpusVault,
     buildCharacterManifest,
     harvestCharacterAssets,
     crc32Hex,

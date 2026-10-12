@@ -299,6 +299,39 @@ function cmdImport(args) {
     req.end(body);
 }
 
+// --- adopt ---------------------------------------------------------------------
+//
+// Mint corpus nanovor into an account (server must be running). Pick one:
+//   adopt --account <id> --all
+//   adopt --account <id> --types 24,27          (all tiers of those types)
+//   adopt --account <id> --assets 157091847,... (specific corpus assetIds)
+function cmdAdopt(args) {
+    const flag = k => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
+    const account = flag('--account');
+    if (!account) die('--account <accountId> is required');
+    const payload = { account };
+    if (args.includes('--all')) payload.all = true;
+    else if (flag('--types')) payload.types = flag('--types').split(',').map(s => Number(s.trim()));
+    else if (flag('--assets')) payload.assetIds = flag('--assets').split(',').map(s => s.trim());
+    else die('specify one of --all | --types a,b | --assets id,id');
+
+    const body = JSON.stringify(payload);
+    const req = http.request({
+        host: '127.0.0.1', port: 8443, method: 'POST', path: '/dev/nanoscope/adopt',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, res => {
+        let text = '';
+        res.on('data', c => { text += c; });
+        res.on('end', () => {
+            console.log(`HTTP ${res.statusCode}`);
+            try { console.log(JSON.stringify(JSON.parse(text), null, 2)); } catch { console.log(text); }
+            if (res.statusCode !== 200) process.exitCode = 1;
+        });
+    });
+    req.on('error', err => die(`could not reach the server on 127.0.0.1:8443 (${err.code}) - is run-server.bat running?`));
+    req.end(body);
+}
+
 // --- restore -------------------------------------------------------------------
 
 function cmdRestore(args) {
@@ -352,7 +385,7 @@ function cmdRestore(args) {
 // --- main ------------------------------------------------------------------------
 
 const [cmd, ...rest] = process.argv.slice(2);
-const commands = { backup: cmdBackup, inspect: cmdInspect, verify: cmdVerify, import: cmdImport, restore: cmdRestore };
+const commands = { backup: cmdBackup, inspect: cmdInspect, verify: cmdVerify, import: cmdImport, adopt: cmdAdopt, restore: cmdRestore };
 if (!commands[cmd]) {
     // Usage = the header comment between the first two // ---- rules.
     const lines = fs.readFileSync(__filename, 'utf8').split(/\r?\n/);
