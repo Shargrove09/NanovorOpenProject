@@ -13,6 +13,8 @@ server.log
 *.log
 # Live account saves (reset-account.bat restores from UserData.orig-backup, which stays tracked)
 server-files/Nanovor Server/Nanovor Server/UserData/
+# Labelled save snapshots made by `dev account snapshot` - personal save data
+server-files/Nanovor Server/Nanovor Server/UserData.snapshots/
 # Stale single-file backup made before the repo was under version control
 *.orig-backup
 
