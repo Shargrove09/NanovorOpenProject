@@ -2175,6 +2175,57 @@ app.post('/device/:deviceId/battle-log', (req, res) => {
     res.send('<battle-log-result><total-updates>0</total-updates><successful-updates>0</successful-updates></battle-log-result>');
 });
 
+// --- corpus adoption + transfer stand-in ledger (shared by /adopt + the guard) ---
+
+// Mint (or refresh) an inventory entry from a corpus vinfo, using the vinfo's
+// embedded assetId VERBATIM (it is inside the signed payload and must match on
+// device readback). Returns { inst, adopted, name, assetTypeId } or { error }.
+function mintCorpusNanovor(user, assetId) {
+    const buf = corpusVault.getVinfo(assetId);
+    if (!buf) return { error: `no corpus vinfo for ${assetId}` };
+    let p;
+    try { p = nanoscope.parseVinfo(buf); } catch (e) { return { error: `bad corpus vinfo ${assetId}: ${e.message}` }; }
+    const master = getVirmonMaster(__dirname, p.assetTypeId);
+    if (!master) return { error: `unknown asset-type-id ${p.assetTypeId}` };
+    if (!user.nanovorInventory) user.nanovorInventory = [];
+    let inst = user.nanovorInventory.find(x => String(x.assetId) === String(assetId));
+    const adopted = !inst;
+    if (!inst) {
+        const now = formatDateForNanovor(new Date());
+        inst = {
+            id: p.assetTypeId, name: master.name, type: 'virmon',
+            assetTypeId: p.assetTypeId, assetId: String(assetId),
+            faction: master.faction, rarity: master.rarity, wave: master.wave,
+            productionNumber: 1, birthDate: now, lastEvolutionDate: now,
+            nickname: '', source: 'nanoscope',
+        };
+        user.nanovorInventory.push(inst);
+    }
+    Object.assign(inst, { speed: p.speed, strength: p.strength, armor: p.armor, health: p.health });
+    return { inst, adopted, name: master.name, assetTypeId: p.assetTypeId };
+}
+
+// Transfer stand-in ledger: scope instance `scopeAssetId` on `deviceId` stands in
+// for the player's real instance `realAssetId`, with a snapshot of that real
+// instance's stats at send time. Keyed by (normalized deviceId, realAssetId).
+function upsertStandIn(user, entry) {
+    if (!user.deviceStandIns) user.deviceStandIns = [];
+    const key = e => `${nanoscope.normalizeDeviceId(e.deviceId)}:${e.realAssetId}`;
+    const i = user.deviceStandIns.findIndex(e => key(e) === key(entry));
+    if (i >= 0) user.deviceStandIns[i] = entry; else user.deviceStandIns.push(entry);
+}
+
+// Corpus ids already standing in for a DIFFERENT real instance on this device, so
+// a batch transfer of several same-species instances gets distinct copies.
+function activeStandInIds(user, deviceId, exceptRealAssetId) {
+    const dn = nanoscope.normalizeDeviceId(deviceId);
+    return (user.deviceStandIns || [])
+        .filter(e => nanoscope.normalizeDeviceId(e.deviceId) === dn && String(e.realAssetId) !== String(exceptRealAssetId))
+        .map(e => String(e.scopeAssetId));
+}
+
+const statSnapshot = inst => ({ speed: inst.speed, strength: inst.strength, armor: inst.armor, health: inst.health });
+
 // Raw bytes, written unchanged to v<N>\vinfo.bbb on the device.
 app.get('/device/:deviceId/asset/:assetId/sign/vinfo', (req, res) => {
     const ctx = deviceRequestUser(req, res, 'sign/vinfo');
@@ -2184,24 +2235,58 @@ app.get('/device/:deviceId/asset/:assetId/sign/vinfo', (req, res) => {
         console.log(`[nanoscope] sign/vinfo: device ${deviceId} is not associated with ${ctx.accountId}`);
         return res.status(403).send('<error>Device not associated</error>');
     }
-    if (!(ctx.user.nanovorInventory || []).some(n => String(n.assetId) === assetId)) {
+    const inst = (ctx.user.nanovorInventory || []).find(n => String(n.assetId) === assetId);
+    if (!inst) {
         console.log(`[nanoscope] sign/vinfo: asset ${assetId} is not in ${ctx.accountId}'s collection`);
         return res.status(404).send('<error>No such asset</error>');
     }
-    // Per-device capture first (exact bytes that came off this device), then the
-    // shared corpus (any validly-signed vinfo - the MAC key is global, so the
-    // device's firmware accepts it regardless of which device originally made it).
-    let blob = deviceVault.getVinfo(deviceId, assetId);
-    let source = 'device vault';
-    if (!blob) { blob = corpusVault.getVinfo(assetId); source = 'corpus'; }
-    if (!blob) {
-        console.log(`[nanoscope] sign/vinfo: NO SIGNED COPY of asset ${assetId} (device vault or corpus). ` +
-            'The client has already cleared v1..v10 - restore them with nanoscope-cli.');
-        return res.status(409).send('<error>No signed copy for this device</error>');
+    const sendBlob = (blob, why) => {
+        console.log(`[nanoscope] sign/vinfo: ${why} for asset ${assetId} to device ${deviceId}`);
+        res.set('Content-Type', 'application/octet-stream');
+        res.send(blob);
+    };
+
+    // 1) Device-origin: exact captured bytes that came off this device.
+    const captured = deviceVault.getVinfo(deviceId, assetId);
+    if (captured) return sendBlob(captured, 'replaying captured (device vault) vinfo');
+
+    // 2) The requested id is itself a corpus copy AND the instance is unmodified
+    //    since adoption -> serve it exactly (it is a disposable scope stand-in).
+    const corpusExact = corpusVault.getVinfo(assetId);
+    if (corpusExact) {
+        let cp = null; try { cp = nanoscope.parseVinfo(corpusExact); } catch { /* fall through */ }
+        const unmodified = cp && inst.speed === cp.speed && inst.strength === cp.strength &&
+            inst.armor === cp.armor && inst.health === cp.health;
+        if (unmodified) return sendBlob(corpusExact, 'replaying corpus (exact) vinfo');
+        // Modified corpus instance (leveled/evolved in place) -> substitute below so
+        // a round-trip can't clobber its accumulated stats.
     }
-    console.log(`[nanoscope] sign/vinfo: replaying ${source} vinfo for asset ${assetId} to device ${deviceId}`);
-    res.set('Content-Type', 'application/octet-stream');
-    res.send(blob);
+
+    // 3) Auto-substitute by species: serve a corpus copy of this type that is not
+    //    already a stand-in for a different real instance on this device. The real
+    //    instance's own id is never written to the device, so import can't clobber it.
+    const standInId = corpusVault.pickCopyForType(inst.assetTypeId, activeStandInIds(ctx.user, deviceId, assetId));
+    if (standInId) {
+        const sub = corpusVault.getVinfo(standInId);
+        const minted = mintCorpusNanovor(ctx.user, standInId); // adopt X so readback resolves it
+        if (minted.error) {
+            console.log(`[nanoscope] sign/vinfo: substitute failed for ${assetId}: ${minted.error}`);
+            return res.status(409).send('<error>No signed copy for this device</error>');
+        }
+        upsertStandIn(ctx.user, {
+            deviceId, scopeAssetId: String(standInId), realAssetId: String(assetId),
+            assetTypeId: inst.assetTypeId, name: inst.name,
+            statSnapshot: statSnapshot(inst), sentAt: new Date().toISOString(),
+        });
+        saveUserData(ctx.accountId);
+        return sendBlob(sub, `substituting corpus ${standInId} as stand-in for ${inst.name}`);
+    }
+
+    // 4) Nothing available: species not in the corpus, or all copies already in use.
+    console.log(`[nanoscope] sign/vinfo: NO signed copy for ${inst.name} (asset ${assetId}, type ` +
+        `${inst.assetTypeId}) - not device-origin and no free corpus copy. The client has already ` +
+        'cleared v1..v10 - restore with nanoscope-cli.');
+    return res.status(409).send('<error>No signed copy for this device</error>');
 });
 
 // Raw bytes, written unchanged to plyinfo.bbb. On failure the client shows
@@ -2367,40 +2452,16 @@ app.post('/dev/nanoscope/adopt', (req, res) => {
     }
     if (!chosen.length) return res.status(404).json({ error: 'nothing in the corpus matched the request' });
 
-    if (!user.nanovorInventory) user.nanovorInventory = [];
-    const now = formatDateForNanovor(new Date());
     const report = [];
-    for (const { assetId, parsed: p } of chosen) {
-        const master = getVirmonMaster(__dirname, p.assetTypeId);
-        if (!master) { report.push({ assetId, error: `unknown asset-type-id ${p.assetTypeId}` }); continue; }
-
-        let inst = user.nanovorInventory.find(x => String(x.assetId) === assetId);
-        const adopted = !inst;
-        if (!inst) {
-            inst = {
-                id: p.assetTypeId,
-                name: master.name,
-                type: 'virmon',
-                assetTypeId: p.assetTypeId,
-                assetId, // verbatim: inside the signed vinfo payload
-                faction: master.faction,
-                rarity: master.rarity,
-                wave: master.wave,
-                productionNumber: 1,
-                birthDate: now,
-                lastEvolutionDate: now,
-                nickname: '',
-                source: 'nanoscope',
-            };
-            user.nanovorInventory.push(inst);
-        }
-        Object.assign(inst, { speed: p.speed, strength: p.strength, armor: p.armor, health: p.health });
+    for (const { assetId } of chosen) {
+        const minted = mintCorpusNanovor(user, assetId); // shared with the sign/vinfo guard
+        if (minted.error) { report.push({ assetId, error: minted.error }); continue; }
         report.push({
             assetId,
-            name: master.name,
-            assetTypeId: p.assetTypeId,
-            adopted, // false = already owned (skipped, not re-id'd)
-            deviceReady: fs.existsSync(path.join(DEVICE_CHARACTERS_DIR, String(p.assetTypeId), 'manifest.xml')),
+            name: minted.name,
+            assetTypeId: minted.assetTypeId,
+            adopted: minted.adopted, // false = already owned (refreshed, not re-id'd)
+            deviceReady: fs.existsSync(path.join(DEVICE_CHARACTERS_DIR, String(minted.assetTypeId), 'manifest.xml')),
         });
     }
     saveUserData(account);
@@ -2409,6 +2470,50 @@ app.post('/dev/nanoscope/adopt', (req, res) => {
     console.log(`[dev] adopted ${added} new corpus nanovor into ${account} (${report.length} requested, ` +
         `${report.filter(r => r.deviceReady).length} device-ready)`);
     res.json({ adopted: added, requested: report.length, nanovor: report });
+});
+
+// Dev: classify an account's collection into what can / cannot be put on a scope.
+// A nanovor is transferable if we can serve a signed vinfo for it: an exact copy
+// (device-origin capture or a corpus id) or, via auto-substitute, any corpus copy
+// of its species. Loopback-only.
+//   POST /dev/nanoscope/transferable {"account":"...","deviceId":"0000000000000999"}
+app.post('/dev/nanoscope/transferable', (req, res) => {
+    const remote = req.socket.remoteAddress || '';
+    if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(remote)) {
+        return res.status(403).json({ error: 'dev endpoints are loopback-only' });
+    }
+    const { account, deviceId } = req.body || {};
+    const user = users[account];
+    if (!user) return res.status(404).json({ error: `no such account: ${account}`, known: Object.keys(users) });
+
+    const byType = corpusVault.listByType();
+    const transferable = [], notTransferable = [];
+    for (const n of user.nanovorInventory || []) {
+        const aid = String(n.assetId);
+        let reason = null;
+        if (deviceId && deviceVault.getVinfo(deviceId, aid)) reason = 'device-origin';
+        else if (corpusVault.has(aid)) reason = 'corpus-exact';
+        else if (byType.has(Number(n.assetTypeId))) reason = 'substitute(type)';
+        const row = { assetId: aid, name: n.name, assetTypeId: n.assetTypeId, reason };
+        if (reason) transferable.push(row); else notTransferable.push(row);
+    }
+    console.log(`[dev] transferable for ${account}${deviceId ? ` / device ${deviceId}` : ''}: ` +
+        `${transferable.length} ok, ${notTransferable.length} not`);
+    res.json({ transferable, notTransferable });
+});
+
+// Dev: dump the transfer stand-in ledger (which scope instance stands in for which
+// real collection instance). Loopback-only.
+//   POST /dev/nanoscope/standins {"account":"..."}
+app.post('/dev/nanoscope/standins', (req, res) => {
+    const remote = req.socket.remoteAddress || '';
+    if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(remote)) {
+        return res.status(403).json({ error: 'dev endpoints are loopback-only' });
+    }
+    const { account } = req.body || {};
+    const user = users[account];
+    if (!user) return res.status(404).json({ error: `no such account: ${account}`, known: Object.keys(users) });
+    res.json({ standIns: user.deviceStandIns || [] });
 });
 
 // Manifest endpoints for version checking and updates

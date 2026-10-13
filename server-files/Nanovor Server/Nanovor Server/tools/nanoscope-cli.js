@@ -11,6 +11,11 @@
 //   node tools/nanoscope-cli.js import  <backup> --account <id>
 //                                                     register device + import nanovor
 //                                                     (server must be running)
+//   node tools/nanoscope-cli.js adopt   --account <id> (--all | --types a,b | --assets id,id)
+//                                                     mint corpus nanovor into the account
+//   node tools/nanoscope-cli.js transferable --account <id> [--device <deviceId>]
+//                                                     which nanovor can go on a scope
+//   node tools/nanoscope-cli.js standins --account <id>   dump the stand-in ledger
 //   node tools/nanoscope-cli.js restore <backup> E: --only v1,v5 [--yes]
 //                                                     write files back (dry run without --yes);
 //                                                     --only v5 --as v8 restores into another slot
@@ -332,6 +337,42 @@ function cmdAdopt(args) {
     req.end(body);
 }
 
+// --- transferable / standins ---------------------------------------------------
+//
+// transferable --account <id> [--device <deviceId>]   which nanovor can go on a scope
+// standins     --account <id>                          dump the stand-in ledger
+function postDev(path, payload) {
+    const body = JSON.stringify(payload);
+    const req = http.request({
+        host: '127.0.0.1', port: 8443, method: 'POST', path,
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, res => {
+        let text = '';
+        res.on('data', c => { text += c; });
+        res.on('end', () => {
+            console.log(`HTTP ${res.statusCode}`);
+            try { console.log(JSON.stringify(JSON.parse(text), null, 2)); } catch { console.log(text); }
+            if (res.statusCode !== 200) process.exitCode = 1;
+        });
+    });
+    req.on('error', err => die(`could not reach the server on 127.0.0.1:8443 (${err.code}) - is run-server.bat running?`));
+    req.end(body);
+}
+
+function cmdTransferable(args) {
+    const flag = k => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
+    const account = flag('--account');
+    if (!account) die('--account <accountId> is required');
+    postDev('/dev/nanoscope/transferable', { account, deviceId: flag('--device') || undefined });
+}
+
+function cmdStandins(args) {
+    const flag = k => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
+    const account = flag('--account');
+    if (!account) die('--account <accountId> is required');
+    postDev('/dev/nanoscope/standins', { account });
+}
+
 // --- restore -------------------------------------------------------------------
 
 function cmdRestore(args) {
@@ -385,7 +426,7 @@ function cmdRestore(args) {
 // --- main ------------------------------------------------------------------------
 
 const [cmd, ...rest] = process.argv.slice(2);
-const commands = { backup: cmdBackup, inspect: cmdInspect, verify: cmdVerify, import: cmdImport, adopt: cmdAdopt, restore: cmdRestore };
+const commands = { backup: cmdBackup, inspect: cmdInspect, verify: cmdVerify, import: cmdImport, adopt: cmdAdopt, transferable: cmdTransferable, standins: cmdStandins, restore: cmdRestore };
 if (!commands[cmd]) {
     // Usage = the header comment between the first two // ---- rules.
     const lines = fs.readFileSync(__filename, 'utf8').split(/\r?\n/);

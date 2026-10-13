@@ -294,6 +294,30 @@ class CorpusVault {
             throw err;
         }
     }
+
+    // Map of assetTypeId -> [assetId, ...] for every corpus copy. Used by the
+    // transfer guard to find a same-species stand-in and to count how many
+    // distinct signed copies of a species exist.
+    listByType() {
+        const byType = new Map();
+        for (const id of this.listAssetIds()) {
+            const buf = this.getVinfo(id);
+            if (!buf) continue;
+            let type;
+            try { type = parseVinfo(buf).assetTypeId; } catch { continue; }
+            if (!byType.has(type)) byType.set(type, []);
+            byType.get(type).push(id);
+        }
+        return byType;
+    }
+
+    // A corpus copy of assetTypeId whose id is not in excludeIds, or null.
+    // Deterministic (sorted) so repeated calls with the same exclude set are stable.
+    pickCopyForType(assetTypeId, excludeIds = []) {
+        const exclude = new Set(excludeIds.map(String));
+        const ids = (this.listByType().get(Number(assetTypeId)) || []).slice().sort();
+        return ids.find(id => !exclude.has(String(id))) || null;
+    }
 }
 
 // --- device character assets ----------------------------------------------------
