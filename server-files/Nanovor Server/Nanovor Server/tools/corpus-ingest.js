@@ -11,8 +11,15 @@
 // package, the butlerhm FW dumps, and local device backups. Because the vinfo
 // MAC key is global, any of these can later be replayed onto any device.
 //
+// Provenance matters: only The List's files are device-agnostic. Files from other
+// devices' dumps were REJECTED (deleted) by the 1.381 firmware when written to a
+// device that did not supply them, which leaves it unbootable. So this also writes
+// Corpus/trusted.json = the assetIds found in The List; the server serves only those
+// to a device that did not supply them.
+//
 // Writes (unless --dry):
 //   Corpus/vinfo/<assetId>.bbb                         (the signed blob)
+//   Corpus/trusted.json                                (assetIds that came from The List)
 //   Manifests/device/Characters/<typeId>/{spr.v2z,nano.snd,manifest.xml}
 // Neither is ever overwritten once present.
 // ---------------------------------------------------------------------------
@@ -27,8 +34,9 @@ const CORPUS_ROOT = path.join(SERVER_ROOT, 'Corpus');
 const CHARACTERS_DIR = path.join(SERVER_ROOT, 'Manifests', 'device', 'Characters');
 const DRY = process.argv.includes('--dry');
 
+const THE_LIST = path.join(REPO_ROOT, '_Project Nanoscope Manager', 'Project Nanoscope Manager', 'nanovor');
 const SOURCES = [
-    path.join(REPO_ROOT, '_Project Nanoscope Manager', 'Project Nanoscope Manager', 'nanovor'),
+    THE_LIST,
     path.join(REPO_ROOT, 'firmware', 'update'),
     path.join(REPO_ROOT, 'firmware', 'community', 'butlerhm', 'FW'),
     path.join(SERVER_ROOT, 'device-backups'),
@@ -49,6 +57,7 @@ const corpus = new ns.CorpusVault(CORPUS_ROOT);
 const seen = new Set();
 let ingested = 0, dupVinfo = 0, bad = 0, sprAdded = 0, sprPresent = 0, sprIncomplete = 0;
 const typesCovered = new Set();
+const trusted = new Set(); // assetIds that came from The List
 const problems = [];
 
 for (const src of SOURCES) {
@@ -61,6 +70,7 @@ for (const src of SOURCES) {
         try { parsed = ns.parseVinfo(buf); } catch (e) { bad++; problems.push(`${path.relative(REPO_ROOT, file)}: ${e.message}`); continue; }
         const type = parsed.assetTypeId;
         typesCovered.add(type);
+        if (src === THE_LIST) trusted.add(parsed.assetId);
 
         // ingest the blob (keyed by embedded assetId)
         if (corpus.has(parsed.assetId)) dupVinfo++;
@@ -81,6 +91,8 @@ console.log(`  signed vinfos ingested: ${ingested}  (already present: ${dupVinfo
 console.log(`  distinct assetIds in corpus now: ${DRY ? seen.size + ' (dry)' : corpus.listAssetIds().length}`);
 console.log(`  distinct TYPE ids covered: ${typesCovered.size}`);
 if (!DRY) console.log(`  character assets: ${sprAdded} added, ${sprPresent} present, ${sprIncomplete} incomplete`);
+if (!DRY) corpus.setTrusted(trusted);
+console.log(`  trusted (The List) : ${trusted.size} of ${DRY ? seen.size : corpus.listAssetIds().length} blobs${DRY ? ' (dry - not written)' : ''}`);
 
 // coverage vs 123 master types
 try {

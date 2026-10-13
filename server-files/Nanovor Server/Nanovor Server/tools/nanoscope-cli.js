@@ -7,6 +7,8 @@
 //   node tools/nanoscope-cli.js backup  E:            copy every file off the device
 //   node tools/nanoscope-cli.js backup  E: --raw      ...plus a raw disk image (admin)
 //   node tools/nanoscope-cli.js inspect E:            decode what's on a device/backup
+//   node tools/nanoscope-cli.js preflight E: --account <id|name>
+//                                                     IS THIS DEVICE SAFE FOR THE CLIENT?
 //   node tools/nanoscope-cli.js verify  <backup> E:   compare a backup with a device
 //   node tools/nanoscope-cli.js import  <backup> --account <id>
 //                                                     register device + import nanovor
@@ -16,6 +18,8 @@
 //   node tools/nanoscope-cli.js transferable --account <id> [--device <deviceId>]
 //                                                     which nanovor can go on a scope
 //   node tools/nanoscope-cli.js standins --account <id>   dump the stand-in ledger
+//   node tools/nanoscope-cli.js consolidate --account <id> [--remove id,id] [--root E:] [--yes]
+//                                                     one entry per nanovor (dry run unless --yes)
 //   node tools/nanoscope-cli.js restore <backup> E: --only v1,v5 [--yes]
 //                                                     write files back (dry run without --yes);
 //                                                     --only v5 --as v8 restores into another slot
@@ -47,12 +51,23 @@ function die(msg) {
     process.exit(1);
 }
 
-function driveRoot(arg) {
+// `bootstrap` is for recovering a WIPED device: the client's Associate "+" deletes
+// every root file including deviceid.bbb, so the usual "is this a Nanoscope?" check
+// would refuse exactly when restore is needed most. With bootstrap we accept a drive
+// that has no deviceid.bbb, as long as it still looks like a Nanoscope volume.
+function driveRoot(arg, { bootstrap = false } = {}) {
     if (!arg) die('missing drive (e.g. E:)');
     const m = /^([A-Za-z]):?\\?$/.exec(arg);
     const root = m ? `${m[1].toUpperCase()}:\\` : path.resolve(arg);
     if (!fs.existsSync(root)) die(`${root} not found - is the Nanoscope plugged in (and switched on)?`);
-    if (!fs.existsSync(path.join(root, 'deviceid.bbb'))) die(`${root} has no deviceid.bbb - not a Nanoscope`);
+    if (!fs.existsSync(path.join(root, 'deviceid.bbb'))) {
+        if (!bootstrap) die(`${root} has no deviceid.bbb - not a Nanoscope (if it was wiped, use: restore <backup> ${arg} --bootstrap)`);
+        // Refuse anything that is obviously not the scope - restoring onto the wrong
+        // drive would scatter 85 MiB of game files across it.
+        const looksLikeScope = ['s1', 'g1'].some(d => fs.existsSync(path.join(root, d)));
+        if (!looksLikeScope) die(`${root} has no deviceid.bbb and no s1/ or g1/ - refusing to treat it as a wiped Nanoscope`);
+        console.log(`WARNING: ${root} has no deviceid.bbb - treating it as a WIPED Nanoscope (--bootstrap)`);
+    }
     return root;
 }
 
@@ -304,6 +319,183 @@ function cmdImport(args) {
     req.end(body);
 }
 
+// --- preflight -------------------------------------------------------------------
+//
+// Run this BEFORE letting the client near a device. On 2026-10-13 the 1.381 unit
+// was associated via the client's "+" while it had never been imported: the "+"
+// wipes v1..v10 and every root file first, then the sync asks the server for a
+// signed plyinfo it does not have (404) and the device is left unbootable.
+//
+// A device is only safe for the client once we hold a signed plyinfo AND its
+// vinfos - that is what `import` captures.
+// Backups usable as "the latest good state". A backup taken AFTER a bad transfer (kept
+// as evidence) is excluded by putting a DO-NOT-RESTORE.txt inside it.
+function goodBackups(backupDir) {
+    if (!fs.existsSync(backupDir)) return [];
+    return fs.readdirSync(backupDir).filter(d =>
+        fs.existsSync(path.join(backupDir, d, 'backup.json')) &&
+        !fs.existsSync(path.join(backupDir, d, 'DO-NOT-RESTORE.txt')));
+}
+
+// v-slots holding a sprite or sound but no vinfo.bbb. `root` is a drive or a backup's files/.
+function orphanedSlots(root) {
+    const out = [];
+    for (let slot = 1; slot <= ns.MAX_DEVICE_NANOVOR; slot++) {
+        const dir = path.join(root, `v${slot}`);
+        if (!fs.existsSync(dir)) continue;
+        const hasVinfo = fs.existsSync(path.join(dir, 'vinfo.bbb'));
+        const hasMedia = fs.existsSync(path.join(dir, 'spr.v2z')) || fs.existsSync(path.join(dir, 'nano.snd'));
+        if (!hasVinfo && hasMedia) out.push(`v${slot}`);
+    }
+    return out;
+}
+
+// Look an account up by accountId OR username. Reading UserData/ is reliable for
+// this even while the server runs, because device registration is persisted the
+// moment it changes (both /dev/nanoscope/import and /device/associate save).
+function findAccount(idOrName) {
+    const dir = path.join(SERVER_ROOT, 'UserData');
+    if (!fs.existsSync(dir)) return null;
+    for (const f of fs.readdirSync(dir).filter(x => x.endsWith('.json'))) {
+        let u;
+        try { u = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch { continue; }
+        if (String(u.id) === String(idOrName) || String(u.username) === String(idOrName)) return u;
+    }
+    return null;
+}
+
+function cmdPreflight(args) {
+    // A wiped device has no deviceid.bbb, which is exactly when we most need to
+    // look at it - so resolve the drive leniently here.
+    const raw = args[0];
+    if (!raw) die('usage: preflight E:');
+    const m = /^([A-Za-z]):?\\?$/.exec(raw);
+    const root = m ? `${m[1].toUpperCase()}:\\` : path.resolve(raw);
+    if (!fs.existsSync(root)) die(`${root} not found - is the Nanoscope plugged in?`);
+
+    const problems = [], warnings = [];
+    const hasDeviceId = fs.existsSync(path.join(root, 'deviceid.bbb'));
+    console.log(`drive        : ${root}`);
+
+    if (!hasDeviceId) {
+        console.log('deviceid.bbb : MISSING - this device looks WIPED');
+        problems.push(`restore it first:  node tools/nanoscope-cli.js restore <backup> ${raw} --bootstrap --yes`);
+    }
+
+    // The firmware writes elog.txt when it fails to boot. If the client sees it,
+    // DeviceErrorLogCheckChainLoadee deletes EVERY file on the device and forces
+    // a firmware push - far worse than the original fault.
+    if (fs.existsSync(path.join(root, 'elog.txt'))) {
+        let lastError = '';
+        try {
+            lastError = fs.readFileSync(path.join(root, 'elog.txt'), 'utf8')
+                .split(/\r?\n/).filter(l => l.startsWith('#')).slice(-1)[0] || '';
+        } catch { /* unreadable */ }
+        console.log(`elog.txt     : PRESENT${lastError ? `  (last error: ${lastError.replace(/^#\s*/, '')})` : ''}`);
+        problems.push('the device wrote an error log - read it, then delete E:\\elog.txt BEFORE opening the client ' +
+            '(it makes the client wipe the whole device and push firmware).' +
+            (/SEC_Verify/.test(lastError) ? ' SEC_Verify* means the firmware rejected a signed file - check for slots with no vinfo.' : ''));
+    }
+
+    let deviceId = null;
+    if (hasDeviceId) {
+        const snap = ns.readDeviceRoot(root);
+        deviceId = snap.device.deviceId;
+        console.log(`device       : ${deviceId}  firmware field ${snap.device.firmware}`);
+        console.log(`nanovor      : ${snap.nanovor.length} slot(s)`);
+
+        const vault = new ns.DeviceVault(path.join(SERVER_ROOT, 'DeviceVault'));
+        const hasPly = Boolean(vault.getPlyinfo(deviceId));
+        // "Covered" = the device supplied it (vault) OR it is a The List file, which the
+        // server may also send, so it can go back on without being in this device's vault.
+        const corpusVault = new ns.CorpusVault(path.join(SERVER_ROOT, 'Corpus'));
+        const vaulted = snap.nanovor.filter(n =>
+            vault.getVinfo(deviceId, n.parsed.assetId) || corpusVault.isTrusted(n.parsed.assetId)).length;
+        console.log(`imported     : plyinfo ${hasPly ? 'YES' : 'NO'}, vinfos ${vaulted}/${snap.nanovor.length}`);
+        if (!hasPly) problems.push(`device ${deviceId} is NOT imported - run:  node tools/nanoscope-cli.js import ${raw} --account <id>`);
+        else if (vaulted < snap.nanovor.length) warnings.push(`${snap.nanovor.length - vaulted} nanovor have no vaulted vinfo - re-run import or they cannot go back on`);
+
+        const backupDir = path.join(BACKUPS_ROOT, deviceId);
+        const stamps = goodBackups(backupDir);
+        console.log(`backups      : ${stamps.length}${stamps.length ? ` (latest ${stamps.sort().pop()})` : ''}`);
+        if (!stamps.length) problems.push(`no backup for ${deviceId} - run:  node tools/nanoscope-cli.js backup ${raw}`);
+
+        // The client byte-compares ITS Sensei cartridge (Nanovor/Assets/device/s1/game.bin)
+        // with the device's s1/game.bin on every sync. If they differ it deletes the device's
+        // s1/ and writes its own - and the firmware rejects a cartridge it doesn't own: it
+        // deletes game.bin, logs SEC_VerifySystem: FAILED, and solo training greys out
+        // (2026-10-13; the client held bbe576d1..., the 1.381 unit's own is e7e134c5...).
+        // So the two must match BEFORE the client is allowed near the device.
+        const clientGame = path.join(SERVER_ROOT, 'Nanovor', 'Assets', 'device', 's1', 'game.bin');
+        const deviceGame = path.join(root, 's1', 'game.bin');
+        if (fs.existsSync(clientGame)) {
+            if (!fs.existsSync(deviceGame)) {
+                problems.push('the device has no s1/game.bin (the firmware deletes a cartridge it rejects). Restore s1/ from a good backup:  node tools/nanoscope-cli.js restore <backup> ' + raw + ' --only s1 --yes');
+            } else if (!fs.readFileSync(clientGame).equals(fs.readFileSync(deviceGame))) {
+                const h = f => require('crypto').createHash('sha256').update(fs.readFileSync(f)).digest('hex').slice(0, 8);
+                console.log(`sensei card  : client ${h(clientGame)} != device ${h(deviceGame)}`);
+                problems.push(`the client's Sensei cartridge (${clientGame}) differs from the device's. On its next sync the client will wipe the device's s1/ and write its own, which the firmware rejects (SEC_VerifySystem, solo training greyed out). Make the client's Nanovor/Assets/device/s1 match the device's first`);
+            } else {
+                console.log('sensei card  : client and device cartridges match');
+            }
+        }
+
+        // A slot with a sprite/sound but NO vinfo.bbb is the fingerprint of the firmware
+        // rejecting a vinfo: it deletes the file it won't accept and leaves the rest, then
+        // fails SEC_VerifySystem and the handheld stops booting (2026-10-13). Compare with
+        // the latest good backup, because a slot that was already like that is a quirk of
+        // this unit (v7 on the 1.381 unit has always been), not new damage.
+        const orphaned = orphanedSlots(root);
+        if (orphaned.length) {
+            const latest = stamps.length ? path.join(backupDir, [...stamps].sort().pop(), 'files') : null;
+            const before = latest ? new Set(orphanedSlots(latest)) : new Set();
+            const fresh = orphaned.filter(x => !before.has(x));
+            const old = orphaned.filter(x => before.has(x));
+            if (old.length) console.log(`note         : ${old.join(', ')} hold a sprite but no vinfo.bbb - already so in the latest good backup, a quirk of this unit rather than new damage`);
+            if (fresh.length) problems.push(`${fresh.join(', ')} hold a sprite but NO vinfo.bbb, and the latest good backup had them intact - the firmware deletes a vinfo it rejects. Restore from that backup before the handheld next boots`);
+        }
+
+        // Registration is PER ACCOUNT while the vault is per device. A device can be
+        // fully imported (vault populated) and still be unregistered for the account
+        // you are about to log in as - and then the client shows the Associate "+"
+        // prompt, which wipes the device. So this must be checked per account.
+        const i = args.indexOf('--account');
+        const account = i >= 0 ? args[i + 1] : null;
+        if (!account) {
+            warnings.push('no --account given, so per-account registration was NOT checked. ' +
+                `If the account you log in as has not registered this device, the client will show the "+" prompt and WIPE it. ` +
+                `Re-run as:  node tools/nanoscope-cli.js preflight ${raw} --account <id|name>`);
+        } else {
+            const acct = findAccount(account);
+            if (!acct) {
+                console.log(`account      : '${account}' NOT FOUND in UserData/`);
+                problems.push(`no account '${account}' - log in once as that user, then:  node tools/nanoscope-cli.js import ${raw} --account <id>`);
+            } else {
+                const registered = (acct.devices || []).some(d => ns.normalizeDeviceId(d.deviceId) === ns.normalizeDeviceId(deviceId));
+                console.log(`account      : ${acct.username} (${acct.id}) - device ${registered ? 'REGISTERED' : 'NOT registered'}`);
+                if (!registered) {
+                    problems.push(`account '${acct.username}' has NOT registered device ${deviceId} - the client will show the Associate "+" prompt and WIPE the device.\n` +
+                        `      run first:  node tools/nanoscope-cli.js import ${raw} --account ${acct.id}`);
+                }
+            }
+        }
+    }
+
+    console.log('');
+    for (const w of warnings) console.log(`WARNING: ${w}`);
+    if (problems.length) {
+        console.log('NOT SAFE for the client:');
+        for (const p of problems) console.log(`  - ${p}`);
+        process.exitCode = 2;
+    } else if (warnings.length) {
+        // Never claim a clean bill of health for a check we did not actually run.
+        console.log('PARTIALLY SAFE: device-level checks pass, but see the warning above before opening the client.');
+        process.exitCode = 1;
+    } else {
+        console.log('SAFE: backed up, imported, and registered to that account - the client can sync this device.');
+    }
+}
+
 // --- adopt ---------------------------------------------------------------------
 //
 // Mint corpus nanovor into an account (server must be running). Pick one:
@@ -366,6 +558,23 @@ function cmdTransferable(args) {
     postDev('/dev/nanoscope/transferable', { account, deviceId: flag('--device') || undefined });
 }
 
+// consolidate --account <id> [--remove id,id] [--root E:] [--yes]
+// Collapse the duplicate entries the scope tooling made into one entry per nanovor. A DRY RUN
+// unless --yes. --root E: lets the server refuse to remove anything that is on the scope now.
+function cmdConsolidate(args) {
+    const flag = k => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
+    const account = flag('--account');
+    if (!account) die('--account <accountId> is required');
+    const rootArg = flag('--root');
+    postDev('/dev/nanoscope/consolidate', {
+        account,
+        remove: (flag('--remove') || '').split(',').map(s => s.trim()).filter(Boolean),
+        root: rootArg ? driveRoot(rootArg) : undefined,
+        apply: args.includes('--yes'),
+    });
+    if (!args.includes('--yes')) console.error('(dry run - add --yes to apply)');
+}
+
 function cmdStandins(args) {
     const flag = k => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
     const account = flag('--account');
@@ -379,7 +588,12 @@ function cmdRestore(args) {
     const backupDir = args[0];
     const manifestFile = path.join(backupDir || '', 'backup.json');
     if (!fs.existsSync(manifestFile)) die(`${manifestFile} not found`);
-    const root = driveRoot(args[1]);
+    const marker = path.join(backupDir, 'DO-NOT-RESTORE.txt');
+    if (fs.existsSync(marker) && !args.includes('--force')) {
+        die(`${backupDir} is marked DO-NOT-RESTORE:\n${fs.readFileSync(marker, 'utf8')}\n(pass --force only if you really mean it)`);
+    }
+    const bootstrap = args.includes('--bootstrap');
+    const root = driveRoot(args[1], { bootstrap });
     const i = args.indexOf('--only');
     const only = i >= 0 ? new Set(String(args[i + 1] || '').toLowerCase().split(',').filter(Boolean)) : null;
     const commit = args.includes('--yes');
@@ -395,8 +609,15 @@ function cmdRestore(args) {
     if (commit) guardAgainstClient(args, { writes: true });
 
     const backup = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-    const live = ns.readDeviceRoot(root).device.deviceId;
-    if (live !== backup.device.deviceId) die(`backup is of device ${backup.device.deviceId} but ${root} is device ${live}`);
+    // A wiped device has no deviceid.bbb to compare against - the restore is what
+    // puts its identity back. Skip the check, having already confirmed in driveRoot
+    // that the drive still looks like a Nanoscope.
+    if (bootstrap) {
+        console.log(`--bootstrap: skipping device-id check; restoring identity of device ${backup.device.deviceId}`);
+    } else {
+        const live = ns.readDeviceRoot(root).device.deviceId;
+        if (live !== backup.device.deviceId) die(`backup is of device ${backup.device.deviceId} but ${root} is device ${live}`);
+    }
 
     // --only matches the first path component: v1, s1, g3, plyinfo.bbb ...
     const picked = backup.files.filter(f => !only || only.has(f.path.split(/[\\/]/)[0].toLowerCase()));
@@ -413,7 +634,11 @@ function cmdRestore(args) {
 
         // Clear H/S/R first so the write isn't refused, then put the original attributes back.
         if (cur) execFileSync('cmd.exe', ['/c', 'attrib', '-h', '-s', '-r', dst]);
-        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        // Only create the folder when it is actually missing: mkdirSync on a drive
+        // root ("E:\") throws EPERM on Windows even with recursive, which is exactly
+        // what a root-level file like deviceid.bbb needs.
+        const dstDir = path.dirname(dst);
+        if (!fs.existsSync(dstDir)) fs.mkdirSync(dstDir, { recursive: true });
         fs.writeFileSync(dst, fs.readFileSync(path.join(backupDir, 'files', f.path)));
         fs.utimesSync(dst, new Date(f.mtime), new Date(f.mtime));
         const flags = f.attributes.replace(/[^HSR]/gi, '').toLowerCase().split('').map(c => `+${c}`);
@@ -426,7 +651,7 @@ function cmdRestore(args) {
 // --- main ------------------------------------------------------------------------
 
 const [cmd, ...rest] = process.argv.slice(2);
-const commands = { backup: cmdBackup, inspect: cmdInspect, verify: cmdVerify, import: cmdImport, adopt: cmdAdopt, transferable: cmdTransferable, standins: cmdStandins, restore: cmdRestore };
+const commands = { backup: cmdBackup, inspect: cmdInspect, preflight: cmdPreflight, verify: cmdVerify, import: cmdImport, adopt: cmdAdopt, transferable: cmdTransferable, consolidate: cmdConsolidate, standins: cmdStandins, restore: cmdRestore };
 if (!commands[cmd]) {
     // Usage = the header comment between the first two // ---- rules.
     const lines = fs.readFileSync(__filename, 'utf8').split(/\r?\n/);

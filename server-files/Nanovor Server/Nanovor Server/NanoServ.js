@@ -46,6 +46,8 @@ const { SenseiAI, getSenseiRoster, buildSenseiSwarm } = require('./battleAI');
 const QUICK_BATTLE_AI_ROSTER_ID = '-4'; // "Medium"
 // Nanoscope handheld: on-device file formats and the vault of captured signed files
 const nanoscope = require('./nanoscope');
+// Account identity + save-file paths, shared with tools/dev.js.
+const accounts = require('./accounts');
 const deviceVault = new nanoscope.DeviceVault(path.join(__dirname, 'DeviceVault'));
 // Shared, device-agnostic store of signed vinfos (The List + dumps). The vinfo
 // MAC key is global, so these replay onto any device; it backstops the per-device
@@ -1336,7 +1338,7 @@ app.post('/bankfe/resources/asset/:assetId/jolt', (req, res) => {
         return res.status(404).send('<error>User not found</error>');
     }
 
-    const nanovor = (user.nanovorInventory || []).find(n => String(n.assetId) === String(assetId));
+    const nanovor = nanoscope.findNanovor(user, assetId); // honours ids a folded nanovor used to have
     if (!nanovor) {
         console.log(`[${new Date().toISOString()}] Jolt spend: asset ${assetId} not found in ${session.accountId}'s inventory`);
         return res.status(404).send('<error>Asset not found</error>');
@@ -1529,7 +1531,7 @@ app.post('/bankfe/resources/evolution/:evolutionId', (req, res) => {
     const sourceAssetId = (body.match(/<source-asset-id>([\s\S]*?)<\/source-asset-id>/) || [, ''])[1].trim();
     const emAssetIds = [...body.matchAll(/<em-asset-id>([\s\S]*?)<\/em-asset-id>/g)].map(m => m[1].trim()).filter(Boolean);
 
-    const source = (user.nanovorInventory || []).find(n => String(n.assetId) === sourceAssetId);
+    const source = nanoscope.findNanovor(user, sourceAssetId);
     if (!source) return sendError(400, 'source nanovor not owned');
 
     if (Number(source.assetTypeId) !== Number(evolution.sourceTypeId)) {
@@ -2113,6 +2115,18 @@ app.post('/device/associate', (req, res) => {
     associateDeviceWithUser(ctx.user, parsed, 'client');
     saveUserData(ctx.accountId);
     console.log(`[nanoscope] associated device ${parsed.deviceId} (firmware field ${parsed.firmware}) with ${ctx.accountId}`);
+
+    // The client has ALREADY wiped v1..v10 and the root files by the time it calls
+    // this. If we hold no signed plyinfo for the device, the very next step
+    // (sign/plyinfo) 404s and the device is left without plyinfo.bbb and without
+    // its UI assets - unbootable, erroring on every plug-in. That is exactly what
+    // happened on 2026-10-13. We cannot undo the wipe, but we can name it loudly.
+    if (!deviceVault.getPlyinfo(parsed.deviceId)) {
+        console.warn(`[nanoscope] *** WARNING: device ${parsed.deviceId} was associated but has NEVER BEEN IMPORTED. ***\n` +
+            '    sign/plyinfo will 404 and the sync will fail, leaving the device wiped and unbootable.\n' +
+            '    Recover with:  node tools/nanoscope-cli.js restore <backup> E: --bootstrap --yes\n' +
+            '    Then import it, and run `nanoscope-cli preflight E:` BEFORE opening the client next time.');
+    }
     res.set('Content-Type', 'application/xml');
     res.send('<device-associate-success/>');
 });
@@ -2177,14 +2191,17 @@ app.post('/device/:deviceId/battle-log', (req, res) => {
 
 // --- corpus adoption + transfer stand-in ledger (shared by /adopt + the guard) ---
 
-// Mint (or refresh) an inventory entry from a corpus vinfo, using the vinfo's
-// embedded assetId VERBATIM (it is inside the signed payload and must match on
-// device readback). Returns { inst, adopted, name, assetTypeId } or { error }.
-function mintCorpusNanovor(user, assetId) {
-    const buf = corpusVault.getVinfo(assetId);
-    if (!buf) return { error: `no corpus vinfo for ${assetId}` };
+// Mint (or refresh) an inventory entry from a signed vinfo, using the vinfo's embedded
+// assetId VERBATIM (it is inside the signed payload and must match on device readback).
+// `buf` overrides the corpus blob (e.g. a copy this device supplied). `refreshStats:false`
+// leaves an already-owned instance untouched, so serving it as a stand-in can never
+// overwrite stats the player earned on the PC.
+// Returns { inst, adopted, name, assetTypeId } or { error }.
+function mintCorpusNanovor(user, assetId, { buf = null, refreshStats = true } = {}) {
+    buf = buf || corpusVault.getVinfo(assetId);
+    if (!buf) return { error: `no vinfo for ${assetId}` };
     let p;
-    try { p = nanoscope.parseVinfo(buf); } catch (e) { return { error: `bad corpus vinfo ${assetId}: ${e.message}` }; }
+    try { p = nanoscope.parseVinfo(buf); } catch (e) { return { error: `bad vinfo ${assetId}: ${e.message}` }; }
     const master = getVirmonMaster(__dirname, p.assetTypeId);
     if (!master) return { error: `unknown asset-type-id ${p.assetTypeId}` };
     if (!user.nanovorInventory) user.nanovorInventory = [];
@@ -2201,7 +2218,9 @@ function mintCorpusNanovor(user, assetId) {
         };
         user.nanovorInventory.push(inst);
     }
-    Object.assign(inst, { speed: p.speed, strength: p.strength, armor: p.armor, health: p.health });
+    // A corpus file is generic; once minted the PC copy owns the stats (a later import must not reset them).
+    if (adopted) inst.pcStats = true;
+    if (adopted || (refreshStats && !inst.pcStats)) Object.assign(inst, { speed: p.speed, strength: p.strength, armor: p.armor, health: p.health });
     return { inst, adopted, name: master.name, assetTypeId: p.assetTypeId };
 }
 
@@ -2215,8 +2234,8 @@ function upsertStandIn(user, entry) {
     if (i >= 0) user.deviceStandIns[i] = entry; else user.deviceStandIns.push(entry);
 }
 
-// Corpus ids already standing in for a DIFFERENT real instance on this device, so
-// a batch transfer of several same-species instances gets distinct copies.
+// Ids already standing in for a DIFFERENT real instance on this device, so a batch
+// transfer of several same-species instances gets distinct copies.
 function activeStandInIds(user, deviceId, exceptRealAssetId) {
     const dn = nanoscope.normalizeDeviceId(deviceId);
     return (user.deviceStandIns || [])
@@ -2226,7 +2245,35 @@ function activeStandInIds(user, deviceId, exceptRealAssetId) {
 
 const statSnapshot = inst => ({ speed: inst.speed, strength: inst.strength, armor: inst.armor, health: inst.health });
 
+// A transfer asks for vinfos one at a time, with no batch boundary. Remember what was
+// just handed out for which request, so two same-species requests in one transfer get
+// distinct ids even before the ledger's saved state could tell us.
+const RECENT_SERVE_MS = 10 * 60 * 1000;
+const recentServes = new Map(); // `${device}:${servedAssetId}` -> { forAsset, at }
+function recentServeExcludes(deviceId, forAsset) {
+    const dn = nanoscope.normalizeDeviceId(deviceId);
+    const now = Date.now(), out = [];
+    for (const [k, v] of recentServes) {
+        if (now - v.at > RECENT_SERVE_MS) { recentServes.delete(k); continue; }
+        if (k.startsWith(`${dn}:`) && v.forAsset !== String(forAsset)) out.push(k.slice(dn.length + 1));
+    }
+    return out;
+}
+
+// DANGER switch. Blobs from OTHER devices' dumps were deleted by the 1.381 firmware
+// (6 of 6 on 2026-10-13), which left the handheld unbootable. Only for a deliberate,
+// backed-up experiment on a device you can afford to restore.
+const ALLOW_UNTRUSTED_CORPUS = process.env.NANOVOR_ALLOW_UNTRUSTED_CORPUS === '1';
+if (ALLOW_UNTRUSTED_CORPUS) {
+    console.warn('[nanoscope] *** NANOVOR_ALLOW_UNTRUSTED_CORPUS=1: foreign vinfos may be sent to devices. ' +
+        'The firmware deleted them last time and the handheld failed SEC_VerifySystem. Back up first. ***');
+}
+
 // Raw bytes, written unchanged to v<N>\vinfo.bbb on the device.
+//
+// What we may send is decided by nanoscope.resolveVinfo (read its header comment): a
+// device-origin copy, a trusted The List copy, or a same-species stand-in from either.
+// Anything else is a 409 - short a nanovor beats an unbootable handheld.
 app.get('/device/:deviceId/asset/:assetId/sign/vinfo', (req, res) => {
     const ctx = deviceRequestUser(req, res, 'sign/vinfo');
     if (!ctx) return;
@@ -2235,58 +2282,89 @@ app.get('/device/:deviceId/asset/:assetId/sign/vinfo', (req, res) => {
         console.log(`[nanoscope] sign/vinfo: device ${deviceId} is not associated with ${ctx.accountId}`);
         return res.status(403).send('<error>Device not associated</error>');
     }
-    const inst = (ctx.user.nanovorInventory || []).find(n => String(n.assetId) === assetId);
+    // The client may still be using an id this nanovor had before it was folded into a scope
+    // file's id (see nanoscope.foldIntoScopeId), so look it up with its aliases too.
+    const inst = nanoscope.findNanovor(ctx.user, assetId);
     if (!inst) {
         console.log(`[nanoscope] sign/vinfo: asset ${assetId} is not in ${ctx.accountId}'s collection`);
         return res.status(404).send('<error>No such asset</error>');
     }
-    const sendBlob = (blob, why) => {
+    const dn = nanoscope.normalizeDeviceId(deviceId);
+    const prior = (ctx.user.deviceStandIns || []).find(e =>
+        nanoscope.normalizeDeviceId(e.deviceId) === dn && String(e.realAssetId) === String(assetId));
+    // Files already bound to ANOTHER nanovor's scope slot must not be handed out again.
+    const boundToOthers = (ctx.user.nanovorInventory || [])
+        .filter(n => n !== inst && n.scopeCopy).map(n => String(n.assetId));
+
+    const r = nanoscope.resolveVinfo({
+        deviceVault, corpusVault, deviceId, inst,
+        excludeIds: [...activeStandInIds(ctx.user, deviceId, assetId), ...recentServeExcludes(deviceId, assetId), ...boundToOthers],
+        preferId: prior && prior.scopeAssetId,
+        allowUntrusted: ALLOW_UNTRUSTED_CORPUS,
+    });
+
+    if (r.kind === 'none') {
+        console.log(`[nanoscope] sign/vinfo: NO safe vinfo for ${inst.name} (asset ${assetId}, type ${inst.assetTypeId}) on ` +
+            `device ${deviceId}: this device never supplied one, and The List has no copy. Refusing rather than send an unproven ` +
+            'blob - the firmware deletes those and the handheld stops booting. The client has already cleared v1..v10 - restore with nanoscope-cli.');
+        return res.status(409).send('<error>No signed copy for this device</error>');
+    }
+    recentServes.set(`${dn}:${r.assetId}`, { forAsset: String(assetId), at: Date.now() });
+
+    const send = why => {
         console.log(`[nanoscope] sign/vinfo: ${why} for asset ${assetId} to device ${deviceId}`);
         res.set('Content-Type', 'application/octet-stream');
-        res.send(blob);
+        res.send(r.blob);
     };
+    if (r.kind === 'device-origin') return send('replaying captured (device vault) vinfo');
+    if (r.kind === 'corpus-exact') return send('replaying The List (exact) vinfo');
 
-    // 1) Device-origin: exact captured bytes that came off this device.
-    const captured = deviceVault.getVinfo(deviceId, assetId);
-    if (captured) return sendBlob(captured, 'replaying captured (device vault) vinfo');
-
-    // 2) The requested id is itself a corpus copy AND the instance is unmodified
-    //    since adoption -> serve it exactly (it is a disposable scope stand-in).
-    const corpusExact = corpusVault.getVinfo(assetId);
-    if (corpusExact) {
-        let cp = null; try { cp = nanoscope.parseVinfo(corpusExact); } catch { /* fall through */ }
-        const unmodified = cp && inst.speed === cp.speed && inst.strength === cp.strength &&
-            inst.armor === cp.armor && inst.health === cp.health;
-        if (unmodified) return sendBlob(corpusExact, 'replaying corpus (exact) vinfo');
-        // Modified corpus instance (leveled/evolved in place) -> substitute below so
-        // a round-trip can't clobber its accumulated stats.
-    }
-
-    // 3) Auto-substitute by species: serve a corpus copy of this type that is not
-    //    already a stand-in for a different real instance on this device. The real
-    //    instance's own id is never written to the device, so import can't clobber it.
-    const standInId = corpusVault.pickCopyForType(inst.assetTypeId, activeStandInIds(ctx.user, deviceId, assetId));
-    if (standInId) {
-        const sub = corpusVault.getVinfo(standInId);
-        const minted = mintCorpusNanovor(ctx.user, standInId); // adopt X so readback resolves it
-        if (minted.error) {
-            console.log(`[nanoscope] sign/vinfo: substitute failed for ${assetId}: ${minted.error}`);
+    // A stand-in X was chosen for this nanovor. The real instance's own id is never written
+    // to the device, so a readback cannot clobber its stats.
+    const leftoverCtx = { deviceVault, corpusVault };
+    // An entry that may be replaced by the fold: a dead leftover, or a The List stand-in we minted
+    // as a separate entry earlier and recorded in the ledger (see isReplaceableStandIn).
+    const replaceable = e => nanoscope.isLeftover(e, leftoverCtx) || nanoscope.isReplaceableStandIn(e, prior, leftoverCtx);
+    const heldBy = nanoscope.findNanovor(ctx.user, r.assetId);
+    const canFold = nanoscope.isFoldable(inst) &&
+        (!heldBy || heldBy === inst || replaceable(heldBy));
+    let how;
+    if (canFold) {
+        // One entry per nanovor: give the real instance the scope file's id instead of adding
+        // a second collection entry for it. The client then resolves the scope's vinfo to it.
+        const f = nanoscope.foldIntoScopeId(ctx.user, inst.assetId, r.assetId, {
+            deviceId, kind: r.kind, canReplace: replaceable,
+        });
+        if (!f.ok) {
+            console.log(`[nanoscope] sign/vinfo: cannot fold ${inst.name} ${assetId} into ${r.assetId}: ${f.reason}`);
             return res.status(409).send('<error>No signed copy for this device</error>');
         }
+        how = f.folded ? `folded ${f.formerAssetId} -> ${r.assetId}${f.removed ? ` (replaced a leftover ${f.removed.name})` : ''}` : 'already folded';
         upsertStandIn(ctx.user, {
-            deviceId, scopeAssetId: String(standInId), realAssetId: String(assetId),
-            assetTypeId: inst.assetTypeId, name: inst.name,
+            deviceId, scopeAssetId: String(r.assetId), realAssetId: String(f.formerAssetId || assetId),
+            assetTypeId: inst.assetTypeId, name: inst.name, kind: r.kind, folded: true,
             statSnapshot: statSnapshot(inst), sentAt: new Date().toISOString(),
         });
-        saveUserData(ctx.accountId);
-        return sendBlob(sub, `substituting corpus ${standInId} as stand-in for ${inst.name}`);
+    } else {
+        // An instance that came FROM a device keeps that device's id, and the file may already
+        // be someone's own entry (e.g. the scope's own copy): keep both entries, record the link.
+        const minted = mintCorpusNanovor(ctx.user, r.assetId, { buf: r.blob, refreshStats: false });
+        if (minted.error) {
+            console.log(`[nanoscope] sign/vinfo: stand-in ${r.assetId} for ${assetId} failed: ${minted.error}`);
+            return res.status(409).send('<error>No signed copy for this device</error>');
+        }
+        nanoscope.syncNanovorCounts(ctx.user);
+        how = `kept as a separate entry (${inst.source === 'nanoscope' ? 'imported from a device' : 'that file is already another entry'})`;
+        upsertStandIn(ctx.user, {
+            deviceId, scopeAssetId: String(r.assetId), realAssetId: String(assetId),
+            assetTypeId: inst.assetTypeId, name: inst.name, kind: r.kind,
+            statSnapshot: statSnapshot(inst), sentAt: new Date().toISOString(),
+        });
     }
-
-    // 4) Nothing available: species not in the corpus, or all copies already in use.
-    console.log(`[nanoscope] sign/vinfo: NO signed copy for ${inst.name} (asset ${assetId}, type ` +
-        `${inst.assetTypeId}) - not device-origin and no free corpus copy. The client has already ` +
-        'cleared v1..v10 - restore with nanoscope-cli.');
-    return res.status(409).send('<error>No signed copy for this device</error>');
+    saveUserData(ctx.accountId);
+    const caution = r.seriesProven === false
+        ? ' [UNTESTED: a The List id series this device has not been seen to hold - back up first]' : '';
+    return send(`stand-in (${r.kind}) ${r.assetId} for ${inst.name}, ${how}${caution}`);
 });
 
 // Raw bytes, written unchanged to plyinfo.bbb. On failure the client shows
@@ -2301,7 +2379,9 @@ app.get('/device/:deviceId/account/:accountId/sign/plyinfo', (req, res) => {
     }
     const blob = deviceVault.getPlyinfo(deviceId);
     if (!blob) {
-        console.log(`[nanoscope] sign/plyinfo: no captured plyinfo for device ${deviceId} - the server cannot sign one`);
+        console.warn(`[nanoscope] sign/plyinfo: NO captured plyinfo for device ${deviceId} - it was associated without being imported.\n` +
+            '    The client has already deleted plyinfo.bbb, so this 404 leaves the device without it.\n' +
+            '    Import the device (or a backup of it) and restore the device from backup.');
         return res.status(404).send('<error>No signed player info for this device</error>');
     }
     console.log(`[nanoscope] sign/plyinfo: replaying captured plyinfo to device ${deviceId}`);
@@ -2362,7 +2442,7 @@ app.post('/dev/nanoscope/import', (req, res) => {
         deviceVault.putVinfo(deviceId, n.vinfo);
         const characterAssets = nanoscope.harvestCharacterAssets(n.dir, p.assetTypeId, DEVICE_CHARACTERS_DIR);
 
-        let inst = user.nanovorInventory.find(x => String(x.assetId) === p.assetId);
+        let inst = nanoscope.findNanovor(user, p.assetId);
         const imported = !inst;
         if (!inst) {
             inst = {
@@ -2382,8 +2462,10 @@ app.post('/dev/nanoscope/import', (req, res) => {
             };
             user.nanovorInventory.push(inst);
         }
-        // The device copy carries the stats as jolted on the handheld.
-        Object.assign(inst, { speed: p.speed, strength: p.strength, armor: p.armor, health: p.health });
+        // The device copy carries the stats as jolted on the handheld - EXCEPT for an instance whose
+        // id is a generic scope file (folded or minted): the scope only ever shows the file's stats,
+        // so the PC's earned stats must win and are not overwritten (pcStats).
+        nanoscope.applyDeviceStats(inst, p);
 
         report.push({
             slot: `v${n.slot}`,
@@ -2397,6 +2479,24 @@ app.post('/dev/nanoscope/import', (req, res) => {
             deviceReady: fs.existsSync(path.join(DEVICE_CHARACTERS_DIR, String(p.assetTypeId), 'manifest.xml')),
         });
     }
+
+    // The stand-in ledger records what we SENT; this import has just read what the device
+    // actually HOLDS. A stand-in the firmware deleted (Plasma Lash 147415019, 2026-10-13),
+    // or one a later transfer replaced, must not stay in the ledger claiming it is on the
+    // scope. Drop this device's entries whose stand-in is not in what was just read.
+    const onDevice = new Set(snap.nanovor.map(n => String(n.parsed.assetId)));
+    const dn = nanoscope.normalizeDeviceId(deviceId);
+    const before = (user.deviceStandIns || []).length;
+    const droppedStandIns = [];
+    user.deviceStandIns = (user.deviceStandIns || []).filter(e => {
+        if (nanoscope.normalizeDeviceId(e.deviceId) !== dn || onDevice.has(String(e.scopeAssetId))) return true;
+        droppedStandIns.push(`${e.name} ${e.realAssetId} -> ${e.scopeAssetId}`);
+        return false;
+    });
+    if (before !== user.deviceStandIns.length) {
+        console.log(`[dev] ledger: dropped ${droppedStandIns.length} stand-in(s) not on device ${deviceId}: ${droppedStandIns.join('; ')}`);
+    }
+    nanoscope.syncNanovorCounts(user);
     saveUserData(account);
 
     console.log(`[dev] imported Nanoscope ${deviceId} into ${account}: ${report.filter(r => r.imported).length} new nanovor, ` +
@@ -2405,6 +2505,7 @@ app.post('/dev/nanoscope/import', (req, res) => {
         device: { deviceId, firmware: snap.device.firmware },
         plyinfoVaulted: Boolean(snap.plyinfo),
         nanovor: report,
+        droppedStandIns,
     });
 });
 
@@ -2461,9 +2562,11 @@ app.post('/dev/nanoscope/adopt', (req, res) => {
             name: minted.name,
             assetTypeId: minted.assetTypeId,
             adopted: minted.adopted, // false = already owned (refreshed, not re-id'd)
+            trusted: corpusVault.isTrusted(assetId), // false = NOT from The List; will not be sent to a device that didn't supply it
             deviceReady: fs.existsSync(path.join(DEVICE_CHARACTERS_DIR, String(minted.assetTypeId), 'manifest.xml')),
         });
     }
+    nanoscope.syncNanovorCounts(user);
     saveUserData(account);
 
     const added = report.filter(r => r.adopted).length;
@@ -2486,20 +2589,121 @@ app.post('/dev/nanoscope/transferable', (req, res) => {
     const user = users[account];
     if (!user) return res.status(404).json({ error: `no such account: ${account}`, known: Object.keys(users) });
 
-    const byType = corpusVault.listByType();
+    // Ask the same resolver a real transfer uses, so this list can never promise
+    // something sign/vinfo would refuse. (Each request is judged on its own: it does not
+    // model several same-species picks in one transfer competing for copies.)
     const transferable = [], notTransferable = [];
     for (const n of user.nanovorInventory || []) {
-        const aid = String(n.assetId);
-        let reason = null;
-        if (deviceId && deviceVault.getVinfo(deviceId, aid)) reason = 'device-origin';
-        else if (corpusVault.has(aid)) reason = 'corpus-exact';
-        else if (byType.has(Number(n.assetTypeId))) reason = 'substitute(type)';
-        const row = { assetId: aid, name: n.name, assetTypeId: n.assetTypeId, reason };
-        if (reason) transferable.push(row); else notTransferable.push(row);
+        const r = nanoscope.resolveVinfo({
+            deviceVault, corpusVault, deviceId: deviceId || '', inst: n,
+            allowUntrusted: ALLOW_UNTRUSTED_CORPUS,
+        });
+        const row = {
+            assetId: String(n.assetId), name: n.name, assetTypeId: n.assetTypeId,
+            reason: r.kind === 'none' ? null : r.kind,
+            // false = a The List id series this device has never been seen to hold
+            ...(r.kind === 'none' ? {} : { sends: r.assetId, proven: r.kind === 'device-origin' || r.kind === 'own-standin' || r.seriesProven !== false }),
+        };
+        if (r.kind === 'none') notTransferable.push(row); else transferable.push(row);
     }
     console.log(`[dev] transferable for ${account}${deviceId ? ` / device ${deviceId}` : ''}: ` +
         `${transferable.length} ok, ${notTransferable.length} not`);
     res.json({ transferable, notTransferable });
+});
+
+// Dev: collapse the duplicate collection entries the scope tooling created, into one entry
+// per nanovor. Dry run unless apply:true.
+//   - FOLD: a stand-in minted as its own entry for a bought/evolved nanovor is merged into
+//     that nanovor (the real instance takes the scope file's id; see nanoscope.foldIntoScopeId).
+//   - REMOVE: entries you name in `remove` (leftovers of failed experiments). Refused for
+//     anything that is not a server-made scope entry, that is bound to a scope slot, that the
+//     ledger points at, or - if `root` (a drive) is given - that is on the device right now.
+//   - counters are recomputed from the collection.
+// Imported instances (they carry another device's id) are never folded.
+//   POST /dev/nanoscope/consolidate {"account":"...","remove":["147384601"],"root":"E:\\","apply":false}
+app.post('/dev/nanoscope/consolidate', (req, res) => {
+    const remote = req.socket.remoteAddress || '';
+    if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(remote)) {
+        return res.status(403).json({ error: 'dev endpoints are loopback-only' });
+    }
+    const { account, remove = [], root, apply = false } = req.body || {};
+    const user = users[account];
+    if (!user) return res.status(404).json({ error: `no such account: ${account}`, known: Object.keys(users) });
+    if (!user.nanovorInventory) user.nanovorInventory = [];
+
+    let onDrive = new Set();
+    if (root) {
+        try { onDrive = new Set(nanoscope.readDeviceRoot(String(root)).nanovor.map(n => String(n.parsed.assetId))); }
+        catch (err) { return res.status(400).json({ error: `cannot read ${root}: ${err.message}` }); }
+    }
+
+    const leftoverCtx = { deviceVault, corpusVault };
+    const before = { entries: user.nanovorInventory.length, nanovorCount: user.nanovorCount, nanovorCountUnique: user.nanovorCountUnique };
+    const plan = { folds: [], keptSeparate: [], removals: [], refused: [] };
+
+    // 1) folds: ledger entries whose stand-in exists as a separate leftover-style entry
+    for (const e of user.deviceStandIns || []) {
+        const standIn = user.nanovorInventory.find(n => String(n.assetId) === String(e.scopeAssetId));
+        const real = nanoscope.findNanovor(user, e.realAssetId);
+        if (!standIn || !real || real === standIn) continue;           // already one entry
+        if (!nanoscope.isFoldable(real)) {
+            plan.keptSeparate.push({ name: real.name, real: String(real.assetId), scope: String(e.scopeAssetId), why: 'imported from a device - keeps that device\'s id' });
+            continue;
+        }
+        if (!(nanoscope.isLeftover(standIn, leftoverCtx) || nanoscope.isReplaceableStandIn(standIn, e, leftoverCtx))) {
+            plan.keptSeparate.push({ name: real.name, real: String(real.assetId), scope: String(e.scopeAssetId), why: 'the scope file is the device\'s own instance, not a stand-in we made' });
+            continue;
+        }
+        plan.folds.push({ name: real.name, real: String(real.assetId), scope: String(e.scopeAssetId), e });
+    }
+
+    // 2) removals the caller asked for
+    const planScope = new Set(plan.folds.map(f => f.scope));
+    const ledgerScope = new Set((user.deviceStandIns || []).map(e => String(e.scopeAssetId)));
+    for (const id of remove.map(String)) {
+        const x = user.nanovorInventory.find(n => String(n.assetId) === id);
+        if (!x) { plan.refused.push({ id, why: 'not in the collection' }); continue; }
+        if (x.source !== 'nanoscope') { plan.refused.push({ id, name: x.name, why: 'not a scope-created entry (bought/evolved)' }); continue; }
+        if (x.scopeCopy) { plan.refused.push({ id, name: x.name, why: 'bound to a scope slot' }); continue; }
+        if (ledgerScope.has(id) && !planScope.has(id)) { plan.refused.push({ id, name: x.name, why: 'the stand-in ledger points at it' }); continue; }
+        if (onDrive.has(id)) { plan.refused.push({ id, name: x.name, why: 'it is on the scope right now' }); continue; }
+        plan.removals.push({ id, name: x.name });
+    }
+
+    const view = {
+        folds: plan.folds.map(({ name, real, scope }) => ({ name, real, scope })),
+        keptSeparate: plan.keptSeparate, removals: plan.removals, refused: plan.refused,
+    };
+    if (!apply) {
+        const after = Math.max(0, before.entries - plan.folds.length - plan.removals.length);
+        return res.json({ applied: false, before, wouldBecome: { entries: after }, ...view });
+    }
+
+    // apply
+    const done = { folded: [], removed: [] };
+    for (const f of plan.folds) {
+        const r = nanoscope.foldIntoScopeId(user, f.real, f.scope, {
+            deviceId: f.e.deviceId, kind: f.e.kind,
+            canReplace: x => nanoscope.isLeftover(x, leftoverCtx) || nanoscope.isReplaceableStandIn(x, f.e, leftoverCtx),
+        });
+        if (!r.ok) { plan.refused.push({ id: f.scope, name: f.name, why: r.reason }); continue; }
+        f.e.folded = true;
+        f.e.realAssetId = String(r.formerAssetId || f.real);
+        done.folded.push(`${f.name} ${f.real} -> ${f.scope}`);
+    }
+    for (const rm of plan.removals) {
+        const i = user.nanovorInventory.findIndex(n => String(n.assetId) === rm.id);
+        if (i >= 0) { user.nanovorInventory.splice(i, 1); done.removed.push(`${rm.name} ${rm.id}`); }
+    }
+    nanoscope.syncNanovorCounts(user);
+    saveUserData(account);
+    console.log(`[dev] consolidate ${account}: folded ${done.folded.length}, removed ${done.removed.length}, ` +
+        `${before.entries} -> ${user.nanovorInventory.length} entries`);
+    res.json({
+        applied: true, before,
+        after: { entries: user.nanovorInventory.length, nanovorCount: user.nanovorCount, nanovorCountUnique: user.nanovorCountUnique },
+        ...done, keptSeparate: plan.keptSeparate, refused: plan.refused,
+    });
 });
 
 // Dev: dump the transfer stand-in ledger (which scope instance stands in for which
@@ -2514,6 +2718,128 @@ app.post('/dev/nanoscope/standins', (req, res) => {
     const user = users[account];
     if (!user) return res.status(404).json({ error: `no such account: ${account}`, known: Object.keys(users) });
     res.json({ standIns: user.deviceStandIns || [] });
+});
+
+// ---------------------------------------------------------------------------
+// Dev: account lifecycle + graceful shutdown, driven by tools/dev.js.
+//
+// These exist so resets do NOT need a server restart. While the server runs the
+// in-memory `users` map is authoritative and UserData/*.json is stale until a
+// save, so anything that reads or rewrites a save must go through here.
+//
+// Loopback-only and unauthenticated, like /dev/nanoscope/*.
+// ---------------------------------------------------------------------------
+function devLoopbackOnly(req, res) {
+    const remote = req.socket.remoteAddress || '';
+    if (/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(remote)) return true;
+    console.warn(`[dev] rejected account request from non-loopback address ${remote}`);
+    res.status(403).json({ error: 'dev endpoints are loopback-only' });
+    return false;
+}
+
+// Summary of one account, preferring in-memory state over the (possibly stale) file.
+function devAccountSummary(username) {
+    const id = generateAccountId(username);
+    const u = users[id];
+    const file = accounts.userFile(__dirname, username);
+    const summary = {
+        username, accountId: id, loaded: Boolean(u),
+        file: fs.existsSync(file) ? path.relative(__dirname, file) : null,
+        protected: !accounts.isTestAccount(username),
+    };
+    if (u) {
+        Object.assign(summary, {
+            nanocash: u.nanocash, nmp: u.nmp,
+            nanovor: (u.nanovorInventory || []).length,
+            ems: (u.emInventory || []).length,
+            jolts: { speed: u.speedJolts || 0, strength: u.strengthJolts || 0, armor: u.armorJolts || 0, health: u.healthJolts || 0 },
+            devices: (u.devices || []).map(d => d.deviceId),
+            standIns: (u.deviceStandIns || []).length,
+        });
+    }
+    return summary;
+}
+
+//   POST /dev/account/list {}
+app.post('/dev/account/list', (req, res) => {
+    if (!devLoopbackOnly(req, res)) return;
+    const names = new Set();
+    for (const id in users) if (users[id] && users[id].username) names.add(users[id].username);
+    const dir = accounts.userDataDir(__dirname);
+    if (fs.existsSync(dir)) {
+        for (const f of fs.readdirSync(dir)) if (f.endsWith('.json')) names.add(f.replace(/\.json$/, ''));
+    }
+    res.json({ accounts: [...names].sort().map(devAccountSummary) });
+});
+
+//   POST /dev/account/snapshot {"username":"n","label":"midgame"}
+// Flushes memory to disk FIRST, otherwise the snapshot would capture stale data.
+app.post('/dev/account/snapshot', (req, res) => {
+    if (!devLoopbackOnly(req, res)) return;
+    const { username, label } = req.body || {};
+    if (!username) return res.status(400).json({ error: 'username is required' });
+    const id = generateAccountId(username);
+    if (users[id]) saveUserData(id); // flush in-memory state before copying
+    const src = accounts.userFile(__dirname, username);
+    if (!fs.existsSync(src)) return res.status(404).json({ error: `no save file for '${username}'` });
+    const tag = label || new Date().toISOString().replace(/[:.]/g, '-');
+    const dest = accounts.snapshotFile(__dirname, username, tag);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(src, dest);
+    console.log(`[dev] snapshot '${username}' -> ${path.relative(__dirname, dest)}`);
+    res.json({ username, label: tag, path: path.relative(__dirname, dest), flushed: Boolean(users[id]) });
+});
+
+//   POST /dev/account/reset {"username":"n","mode":"baseline"|"fresh"|"snapshot","label":"..."}
+// Rebuilds the account in memory AND on disk, so no restart is needed. An active
+// client keeps its token (sessions key off accountId) but its cached UI is stale -
+// re-login or relaunch the client after a reset.
+app.post('/dev/account/reset', (req, res) => {
+    if (!devLoopbackOnly(req, res)) return;
+    const { username, mode = 'baseline', label, force } = req.body || {};
+    if (!username) return res.status(400).json({ error: 'username is required' });
+    if (!accounts.isTestAccount(username) && !force) {
+        return res.status(403).json({
+            error: `'${username}' is a protected account - pass force:true to reset it`,
+            testAccounts: accounts.TEST_ACCOUNTS,
+        });
+    }
+    const id = generateAccountId(username);
+
+    if (mode === 'fresh') {
+        users[id] = createUserProfile(id, username); // same path a brand-new login takes
+    } else {
+        const src = mode === 'snapshot'
+            ? accounts.snapshotFile(__dirname, username, label || '')
+            : accounts.baselineFile(__dirname, username);
+        if (!label && mode === 'snapshot') return res.status(400).json({ error: 'label is required for mode "snapshot"' });
+        if (!fs.existsSync(src)) return res.status(404).json({ error: `not found: ${path.relative(__dirname, src)}` });
+        let parsed;
+        try { parsed = JSON.parse(fs.readFileSync(src, 'utf8')); } catch (e) { return res.status(400).json({ error: `bad JSON in ${path.basename(src)}: ${e.message}` }); }
+        parsed.id = id;            // keep identity consistent with the username
+        parsed.username = username;
+        users[id] = parsed;
+    }
+    saveUserData(id);
+    console.log(`[dev] reset account '${username}' (${id}) from ${mode}${label ? ` '${label}'` : ''}`);
+    res.json({ reset: mode, label: label || null, account: devAccountSummary(username) });
+});
+
+//   POST /dev/shutdown {}
+// Same graceful path as the SIGINT handler: save every user, then close.
+// Windows makes sending Ctrl+C to another process awkward, so dev.js uses this.
+app.post('/dev/shutdown', (req, res) => {
+    if (!devLoopbackOnly(req, res)) return;
+    const saved = Object.keys(users).length;
+    res.json({ stopping: true, accountsSaved: saved });
+    console.log(`[dev] shutdown requested - saving ${saved} account(s)`);
+    setTimeout(() => {
+        for (const userId in users) saveUserData(userId);
+        try { server.close(); } catch { /* ignore */ }
+        try { sfsServer.close(); } catch { /* ignore */ }
+        console.log('[dev] shutdown complete');
+        process.exit(0);
+    }, 50); // let the response flush first
 });
 
 // Manifest endpoints for version checking and updates
@@ -4050,7 +4376,7 @@ function persistBattleResult(battleRoom, engine, over) {
     user.nmp = (user.nmp || 0) + (won ? NMP_DELTA.WIN : NMP_DELTA.LOSS);
 
     for (const bn of human.swarm) {
-        const inv = (user.nanovorInventory || []).find(n => String(n.assetId) === bn.assetId);
+        const inv = nanoscope.findNanovor(user, bn.assetId);
         if (!inv) continue;
         inv.killCount = (inv.killCount || 0) + bn.killCount;
         inv.lifetimeKillCount = (inv.lifetimeKillCount || 0) + bn.killCount;
@@ -4344,7 +4670,7 @@ function handleGameXtCommand(socket, command, params) {
                 // from both sides' actual swarms instead of just recording ids.
                 const user = users[socket.userId];
                 const validEntries = nanovorIds
-                    .map(id => (user && user.nanovorInventory || []).find(n => String(n.assetId) === id))
+                    .map(id => user && nanoscope.findNanovor(user, id))
                     .filter(Boolean);
 
                 if (validEntries.length === 0) {
@@ -5881,10 +6207,9 @@ function generateToken() {
 //
 // Derived from the username so an existing account keeps a stable id across
 // restarts. 2^31-1 ceiling keeps it inside int range.
+// Shared with tools/dev.js so the CLI resolves a username to the same id.
 function generateAccountId(username) {
-    const digest = crypto.createHash('md5').update(username).digest('hex');
-    const numeric = parseInt(digest.substring(0, 8), 16) % 2147483647;
-    return String(numeric || 1); // never 0 - the client treats 0 as "no account"
+    return accounts.generateAccountId(username);
 }
 
 // Function to format date in the correct format: YYYY-MM-DDTHH:MM:SS.mmm+HH:MM

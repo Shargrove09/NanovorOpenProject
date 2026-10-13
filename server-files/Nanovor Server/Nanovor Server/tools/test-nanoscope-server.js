@@ -151,13 +151,47 @@ async function main() {
         });
     }
 
-    await test('sign/vinfo for an asset with no captured copy -> 409', async () => {
+    // Non-device nanovor. A device only accepts vinfos it can verify, and rejects the
+    // rest by DELETING them (2026-10-13: 6 foreign vinfos deleted, handheld unbootable).
+    // So the server may send only (a) a vinfo this device supplied or (b) a The List file,
+    // and answers 409 for anything else - short a nanovor beats an unbootable handheld.
+    const corpus = new ns.CorpusVault(path.join(ROOT, 'Corpus'));
+    const deviceVault = new ns.DeviceVault(path.join(ROOT, 'DeviceVault'));
+    const ownTypes = deviceVault.listByType(rawId);
+    // A corpus file only counts when it is a The List file in a series this device already
+    // holds (a The List file in another series, e.g. Plasma Lash 147415019, was deleted).
+    const heldSeries = ns.deviceSeries(deviceVault, rawId);
+    const safeTypes = new Set([...ownTypes.keys()]);
+    for (const [type, ids] of corpus.listByType()) {
+        if (ids.some(i => corpus.isTrusted(i) && heldSeries.has(ns.idSeries(i)))) safeTypes.add(type);
+    }
+    const ownedOffDevice = await (async () => {
         const res = await request('GET', `/bankfe/resources/account/${accountId}/asset${q}`);
-        const ids = [...res.body.toString().matchAll(/<asset id="([^"]+)"[^>]*>\s*<asset-type-category>virmon/g)].map(m => m[1]);
         const deviceIds = new Set(snap.nanovor.map(n => n.parsed.assetId));
-        const other = ids.find(id => !deviceIds.has(id));
-        assert.ok(other, 'account has no non-device nanovor to try');
-        const r = await request('GET', `/device/${rawId}/asset/${other}/sign/vinfo${q}`);
+        return [...res.body.toString().matchAll(/<asset id="([^"]+)"[\s\S]*?<\/asset>/g)]
+            .filter(m => /<asset-type-category>virmon/.test(m[0]))
+            .map(m => ({ id: m[1], typeId: Number((m[0].match(/<asset-type-id>(\d+)<\/asset-type-id>/) || [, 0])[1]) }))
+            .filter(a => !deviceIds.has(a.id));
+    })();
+
+    await test('sign/vinfo sends a SAFE stand-in (device-supplied or The List) for an off-device species', async () => {
+        const a = ownedOffDevice.find(x => safeTypes.has(x.typeId));
+        if (!a) return console.log('        (skipped - no off-device nanovor of a species with a safe copy)');
+        const r = await request('GET', `/device/${rawId}/asset/${a.id}/sign/vinfo${q}`);
+        assert.strictEqual(r.status, 200, `expected a stand-in, got ${r.status}`);
+        assert.strictEqual(r.body.length, ns.VINFO_SIZE, 'stand-in must be a full 4194-byte vinfo');
+        const sent = ns.parseVinfo(r.body);
+        assert.strictEqual(sent.assetTypeId, a.typeId, 'stand-in must be the same species');
+        const fromDevice = Boolean(deviceVault.getVinfo(rawId, sent.assetId));
+        const fromList = corpus.isTrusted(sent.assetId) && heldSeries.has(ns.idSeries(sent.assetId));
+        assert.ok(fromDevice || fromList,
+            `sent ${sent.assetId}, which this device never supplied and is not a The List file in a series it holds - the firmware deletes those`);
+    });
+
+    await test('sign/vinfo -> 409 when no safe copy exists (never an unproven blob)', async () => {
+        const a = ownedOffDevice.find(x => !safeTypes.has(x.typeId));
+        if (!a) return console.log('        (skipped - account owns no nanovor of a species with no safe copy)');
+        const r = await request('GET', `/device/${rawId}/asset/${a.id}/sign/vinfo${q}`);
         assert.strictEqual(r.status, 409);
     });
 
